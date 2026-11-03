@@ -22,11 +22,12 @@ function seedEnded(store: Map<string, unknown>, id: string, overrides: Record<st
   store.set(`appended:${id}`, { thread: 't', items: {} })
 }
 
-type ReminderKind = 'manual' | 'not set up' | 'none'
+type ReminderKind = 'manual' | 'not set up' | 'stopped' | 'none'
 
 /** The reminder the band shows a session Delta does not sync, by what it tells the person. */
 async function reminderKind($: Engine): Promise<ReminderKind> {
   const band = await drawBandText($)
+  if (band.includes('Sync stopped') && band.includes('/delta-start')) return 'stopped'
   if (band.includes('Not syncing') && band.includes('/delta-share')) return 'manual'
   return band.includes('Not set up') && band.includes('/delta-setup') ? 'not set up' : 'none'
 }
@@ -109,6 +110,31 @@ describe('automatic activation', () => {
     expect(fake.server.thread).toBeUndefined()
     expect(fake.operations()).not.toContain('create')
     expect(binding(fake)).toBeUndefined()
+    fake.expectClean()
+  })
+
+  test('a new session in a stopped repository never activates, and /delta-start lets the next one', async ($, on) => {
+    const fake = fakeThreads(on)
+    fake.files.set(POLICY, JSON.stringify({ threads: { mode: 'organization', organization: 'org-1', stopped: true } }))
+    await startAuto($, fake)
+    expect(fake.server.thread).toBeUndefined()
+    expect(fake.operations()).not.toContain('create')
+    expect(binding(fake)).toBeUndefined()
+    await $.command.run({ ...typedDelta('start'), command: 'delta-start', args: '' } as never)
+    await fake.settle()
+    expect(JSON.parse(fake.files.get(POLICY)!)).toEqual({ threads: { mode: 'organization', organization: 'org-1' } })
+    fake.expectClean()
+  })
+
+  test('/delta stop saves the stop, and the next new session does not sync', async ($, on) => {
+    const fake = fakeThreads(on)
+    fake.files.set(POLICY, policy('manual', 'org-1'))
+    await startAuto($, fake)
+    const result = await $.command.run(typedDelta('stop'))
+    await fake.settle()
+    expect(JSON.stringify(result)).toContain('Stopped Delta sync')
+    expect(JSON.parse(fake.files.get(POLICY)!)).toEqual({ threads: { mode: 'manual', organization: 'org-1', stopped: true } })
+    expect(await reminderKind($)).toBe('stopped')
     fake.expectClean()
   })
 
@@ -253,6 +279,8 @@ describe('automatic activation', () => {
     { name: 'an unconfigured checkout is told how to set up', expected: 'not set up' },
     { name: 'a Manual checkout is told how to share, not to set up', expected: 'manual',
       arrange: (fake) => { fake.files.set(POLICY, policy('manual')) } },
+    { name: 'a stopped checkout is told how to resume', expected: 'stopped',
+      arrange: (fake) => { fake.files.set(POLICY, JSON.stringify({ threads: { mode: 'private', organization: 'org-1', stopped: true } })) } },
     { name: 'a headless session gets none', expected: 'none', arrange: (fake) => { fake.surfaces = [] } },
     { name: 'a session with an unfinished join gets none', source: 'resume', expected: 'none',
       arrange: (fake) => { seedResumed(fake, { snapshot: false, joinTransition: { locator: 'x' } }) } },

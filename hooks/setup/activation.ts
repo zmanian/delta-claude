@@ -564,12 +564,13 @@ function onboardingStore(host: Host): OnboardingStore {
 }
 
 /**
- * The band's reminder for a session while Delta does not sync it: a checkout with any setting points
- * to /delta-share, and one never set up to /delta-setup. A syncing session's band says `Syncing`
+ * The band's reminder for a session while Delta does not sync it: a stopped checkout points to
+ * /delta-start, one with any other setting to /delta-share, and one never set up to /delta-setup. A syncing session's band says `Syncing`
  * instead, so an automatic checkout's sessions show this only when they are not syncing, as a session
  * started before the setting was saved, or one Delta could not start.
  */
 function syncReminder(policy: ProjectPolicy): SyncReminder {
+  if (policy.stopped) return 'stopped'
   // Someone who chose a setting is not nudged toward setup every session.
   return policy.configured ? 'manual' : 'not set up'
 }
