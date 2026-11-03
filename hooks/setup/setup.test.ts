@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 import {
   type Interaction, InteractionDismissedError, InteractionUnavailableError, inviteResultsFrom, offerOnboarding,
-  runSetupWizard, type SetupEnv,
+  runSetupWizard, type SetupEnv, startSync, stopSync,
 } from './setup'
 
 /** An environment over an in-memory file, with the questions answered from a queue. */
@@ -399,3 +399,50 @@ function memoryStore() {
   const backend = { get: async (key: string) => store.get(key), set: async (key: string, value: unknown) => { store.set(key, value) } }
   return { store, backend }
 }
+
+describe('/delta stop and /delta start', () => {
+  const automatic = JSON.stringify({ threads: { mode: 'private', organization: 'org-1' } })
+
+  test('stop saves the setting with its mode and team, keeps it out of Git, and start returns to it', async () => {
+    const exclude = '/repo/.git/info/exclude'
+    const h = harness({ file: automatic, commonDir: '/repo/.git' })
+    const stopped = await stopSync(h.env)
+    expect(stopped.status).toBe('wrote')
+    expect(stopped.text).toContain('/delta-start')
+    expect(JSON.parse(h.current()!)).toEqual({ threads: { mode: 'private', organization: 'org-1', stopped: true } })
+    expect(h.others.get(exclude)).toBe('/.delta/settings.json\n')
+    // Stopping twice changes nothing and says how to resume.
+    expect(await stopSync(h.env)).toEqual({ status: 'unchanged', text: expect.stringContaining('/delta-start') })
+    expect(h.writes).toHaveLength(1)
+
+    const started = await startSync(h.env)
+    expect(started.status).toBe('wrote')
+    expect(started.text).toContain('Private sync')
+    expect(JSON.parse(h.current()!)).toEqual(JSON.parse(automatic))
+    expect((await startSync(h.env)).status).toBe('unchanged')
+  })
+
+  test('stop works in a checkout that was never set up, and start then points to setup', async () => {
+    const h = harness({ file: undefined })
+    expect((await stopSync(h.env)).status).toBe('wrote')
+    expect(JSON.parse(h.current()!)).toEqual({ threads: { stopped: true } })
+    expect((await startSync(h.env)).text).toContain('/delta-setup')
+  })
+
+  test('a session that already syncs is told it keeps syncing until it ends', async () => {
+    const h = harness({ file: automatic, audience: 'private' })
+    expect((await stopSync(h.env)).text).toContain('This session keeps syncing until it ends.')
+    const quiet = harness({ file: automatic })
+    expect((await stopSync(quiet.env)).text).not.toContain('keeps syncing')
+  })
+
+  test('an unreadable setting, a failed write, or no checkout changes nothing and says why', async () => {
+    const broken = harness({ file: '{ broken' })
+    expect(await stopSync(broken.env)).toEqual({ status: 'failed', text: expect.stringContaining('/delta-setup') })
+    expect(broken.writes).toEqual([])
+    const readOnly = harness({ file: automatic, failWrite: true })
+    expect(await stopSync(readOnly.env)).toEqual({ status: 'failed', text: expect.stringContaining('could not save') })
+    const outside = harness({ root: null })
+    expect(await stopSync(outside.env)).toEqual({ status: 'failed', text: expect.stringContaining('needs a Git checkout') })
+  })
+})

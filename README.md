@@ -100,6 +100,16 @@ Setup can create a team and invite teammates by email. It saves your choice to
 The plugin offers setup once per repository: right after you install it, or the
 first time you start a session in a repository that isn't set up yet.
 
+### Stopping sync
+
+Run `/delta-stop` to stop syncing a repository's sessions without losing its setting.
+New sessions there don't sync, even under Private sync or Team sharing, until you run
+`/delta-start`, which returns to the saved setting. The stop is saved to
+`.delta/settings.json` as `"stopped": true` under `threads`, so it lasts across
+sessions and restarts. A session that is already syncing keeps syncing until it ends,
+and `/delta-share` still syncs a session when you ask. Choosing a setting in
+`/delta-setup` also starts sync again.
+
 If automatic sync needs you to sign in, an interactive session asks before opening
 your browser. If Delta's beta terms still need accepting, it offers to open them too.
 You can keep working while you finish; that same session then syncs, including
@@ -121,6 +131,8 @@ its own opens a menu of these actions.
 | `/delta-share [<email>…]` | Sync the current session and its checkout, and choose who sees it |
 | `/delta-join <link>` | Join a shared thread in a fresh session, in the thread's checkout |
 | `/delta-setup` | Choose this repository's team and which sessions sync |
+| `/delta-stop` | Stop syncing new sessions in this repository, and remember it |
+| `/delta-start` | Resume syncing this repository after `/delta-stop` |
 | `/delta-update` | Update the installed Delta app and CLI |
 | `/delta-plugin-update [check \| notifications on\|off]` | Update the Claude Code plugin and reload, check its version, or control update notifications |
 | `/delta-org list` | List your Delta teams |
