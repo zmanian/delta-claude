@@ -5,13 +5,16 @@
 import { AccessRequiredError, requireAuthentication } from '../cli/auth'
 import { clearProgress, finishProgress, setProgress, threadOrganization } from '../band/band'
 import { messageUpdates, resultUpdate } from '../recording/content'
-import { drain, flushUnsaved, recordsOffline, rememberToolResults, stageRecord, verifyCheckout } from '../recording/delivery'
+import {
+  drain, flushUnsaved, recordsOffline, recordsPlans, rememberToolResults, stageRecord, verifyCheckout,
+} from '../recording/delivery'
 import {
   type CommandForm, requireContract, resolveCli, stopSessionMounts, threadCreate, threadInvite, threadShare,
   threadStatus,
 } from '../cli/delta-cli'
 import { worktreeHistory } from '../cli/command-outcomes'
 import { attachWorktree, mountCheckout } from './checkout'
+import { activate, followTranscript } from '../setup/activation'
 import { activeBackgroundAgents } from './lifecycle'
 import { authenticationHost, claudeInteraction } from '../setup/interaction'
 import {
@@ -27,7 +30,6 @@ import {
   InteractionDismissedError, InteractionUnavailableError, invitationSummary, remoteRefusal, type SessionResume,
   type SessionStop,
 } from '../setup/setup'
-import { activate } from '../setup/activation'
 import { type AudienceAnswer, chooseShareAudience, type ShareAudience } from './share-audience'
 import { snapshotMessages } from '../recording/snapshot'
 import { children, deliverChild, forgetSubagents, recordsChildren } from '../subagents/subagents'
@@ -87,7 +89,7 @@ async function assertShareSession(host: Host, request: ShareRequest) {
 
 /**
  * Whether a session already syncs: it is on the server, or handed to Delta's background uploader. Such
- * a session keeps its audience when it reconnects and cannot become private to its owner again.
+ * a session keeps its audience when it reconnects; `/delta unshare` can make it private.
  */
 export function sessionSyncs(binding: Binding | undefined): boolean {
   return !!binding?.url || !!binding?.autoUpload
@@ -249,10 +251,11 @@ async function share(host: Host, request: ShareRequest): Promise<ShareOutcome> {
       await serial(async () => {
         let state = await load(host, session)
         await assertShareSession(host, request)
+        const plans = recordsPlans(session)
         for (const [index, message] of snapshot.entries()) {
-          rememberToolResults(runtime.tools, message)
+          rememberToolResults(runtime.tools, message, plans)
           const updates = messageUpdates(message, `snapshot:${index}`, runtime.tools.structuredResults,
-            { root, omitted: runtime.tools.omitted })
+            { root, omitted: runtime.tools.omitted, plans })
           for (const update of updates) state = await stageRecord(host, state, { update })
         }
         // Commit the complete immutable plan and its pending receipts together. Until
@@ -295,9 +298,10 @@ async function share(host: Host, request: ShareRequest): Promise<ShareOutcome> {
     const created = await threadCreate(host, {
       externalId: session, organization: organization ? { id: organization, visibility: 'private' } : undefined, check,
     })
-    if (binding.thread && created.thread_id !== binding.thread)
+    const knownThread = binding.thread ?? binding.pendingActivation?.thread
+    if (knownThread && created.thread_id !== knownThread)
       throw new Error('Delta returned a different thread for this session; the existing binding was preserved')
-    if (!binding.thread && !created.created) {
+    if (!knownThread && !created.created) {
       const status = await threadStatus(host, created.thread_id, session)
       validateThreadFrontier(status, { session, thread: created.thread_id, next: binding.next, pending: binding.pending })
       // A durable identity always precedes append. A staged plan alone may have
@@ -307,7 +311,8 @@ async function share(host: Host, request: ShareRequest): Promise<ShareOutcome> {
     }
     // Persist identity before further fallible commands; creation is idempotent if this write fails.
     await serial(async () => save(host, {
-      ...await load(host, session), thread: created.thread_id, ...organization ? { organization } : {},
+      ...await load(host, session), thread: created.thread_id, pendingActivation: undefined,
+      ...organization ? { organization } : {},
       ...privateUpload ? { autoUpload: { mode: 'private' as const, organization: organization! } } : {},
     }))
     binding = await serial(() => load(host, session))
@@ -364,6 +369,11 @@ async function share(host: Host, request: ShareRequest): Promise<ShareOutcome> {
   await startConversation(host, session)
   await assertShareSession(host, request)
   setProgress(host, 'Syncing files…', 'active', [5, 5])
+  // Claude named the session before it was shared, and polling for a title starts only with a turn, so
+  // the title is staged now and delivered with the snapshot. Not before: delivering a record checks the
+  // thread is published, and a failed check pauses sharing. A title that cannot be read fails nothing.
+  await followTranscript(host, session).catch((error) =>
+    host.ui.log(`Couldn't look for this session's title: ${String(error)}`, { to: 'debug' }))
   await drain(host, session)
   for (const child of children.values()) if (child.session === session) void deliverChild(host, child)
   // The stop forgot this session's subagents; they record again as an activation would restore them.

@@ -124,6 +124,8 @@ Headless sessions never open a browser.
 
 `/delta-share` asks who should see the session: your team, just you, or people
 you name by email address. `/delta-share ada@example.com` invites them directly.
+`/delta-unshare` makes the current thread private without stopping sync. People
+invited explicitly retain access.
 
 ### Commands
 
@@ -133,6 +135,7 @@ its own opens a menu of these actions.
 | Command | Description |
 | --- | --- |
 | `/delta-share [<email>…]` | Sync the current session and its checkout, and choose who sees it |
+| `/delta-unshare` | Make the current thread private while keeping sync and explicit invitations |
 | `/delta-join <link>` | Join a shared thread in a fresh session, in the thread's checkout |
 | `/delta-setup` | Choose this repository's team and which sessions sync |
 | `/delta-stop` | Stop syncing this session and new sessions in this repository, and remember it |
@@ -154,6 +157,15 @@ inputs and outputs and Claude's thinking, plus the files in your checkout
 (staged, unstaged, and untracked files that aren't ignored). Nothing is uploaded
 until you share or join a session, or the repository's setting syncs it
 automatically.
+
+After a recorded turn, the plugin asks Claude Code's `haiku` model to summarize
+the turn and maintain a short search summary. It sends bounded turn prose
+and the previous description through your Claude Code session's credentials,
+not Delta's inference configuration. This uses your Claude plan, API, or configured
+provider and may be unavailable if Haiku is blocked or rate-limited. A summary
+that cannot finish before Claude Code exits is omitted; recording still works.
+The generated title is separate from your visible thread title and never replaces
+a manual rename.
 
 A shared or joined session shows you as connected through Claude Code. An open
 Delta view takes precedence.
