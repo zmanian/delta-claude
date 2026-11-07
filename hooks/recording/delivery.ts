@@ -23,7 +23,7 @@ import type { Host } from '../core/host'
 import { children, deliverChild, stopReasonOf } from '../subagents/subagents'
 import {
   appendFailure, classifyCommandFailure, DeltaCommandError, DeltaSendError, JoinNotReadyError, permanentFailureAdvice,
-  type ThreadTurn, validateJoinedMounts, validateThreadCheckout, validateThreadFrontier,
+  PLAN_CONTRACT_VERSION, type ThreadTurn, validateJoinedMounts, validateThreadCheckout, validateThreadFrontier,
 } from '../cli/thread-commands'
 import { errorText } from '../core/text'
 import type { ToolRecords } from './tool-records'
@@ -32,8 +32,15 @@ import { settleRemote, storeShownRow } from '../watch/rows'
 import { scheduleMove } from '../sharing/join'
 import { shownCommandRewrite } from '../watch/row-delivery'
 import { beginAppend, beginShare, endAppend, waitForSnapshot } from '../sharing/share'
+import { recordThreadSummary } from './thread-summary'
 
-export type RecordBody = { update: Update; turnSequence?: number }
+export type RecordBody =
+  | { update: Update; turnSequence?: number; summary?: never }
+  | { update?: never; turnSequence: number; summary: {
+    turnSummary: string
+    threadSummary: { generatedTitle: string; summary: string; keywords: string[]; intents: string[] } | null
+    sourceVersion: string
+  } }
 export type CleanupPlan = { session: string; root: string; next: number; pending: { sequence: number; files: string[] }[] }
 const LIVE_ACTIVITY_ORIGIN = {
   work_origin: 'external_agent',
@@ -54,11 +61,16 @@ export function recordsOffline(session: string, binding: Binding | undefined): b
   return !!binding && !binding.joined && verifiedContract(session) !== undefined
 }
 
-export function rememberToolResults(tools: ToolRecords, message: ApiMessage) {
+/** Whether this session records TodoWrite as its turn's plan: its CLI accepts `plan_update`. */
+export function recordsPlans(session: string): boolean {
+  return (verifiedContract(session) ?? 0) >= PLAN_CONTRACT_VERSION
+}
+
+export function rememberToolResults(tools: ToolRecords, message: ApiMessage, plans = false) {
   for (const block of message.content) {
     if (block.type === 'tool_result' && typeof block.tool_use_id === 'string')
       tools.toolResults.set(block.tool_use_id, block)
-    else if (block.type === 'tool_use' && typeof block.id === 'string' && isOmittedTool(block.name))
+    else if (block.type === 'tool_use' && typeof block.id === 'string' && isOmittedTool(block.name, plans))
       tools.omitted.add(block.id)
   }
 }
@@ -128,6 +140,9 @@ export async function stageRecord(host: Host, binding: Binding, body: RecordBody
 export async function stageOutboxRecord<T extends { next: number; pending: Entry[] }>(
   host: Host, folder: string, binding: T, body: RecordBody,
 ): Promise<T> {
+  // Delta shows a plan only on a turn and rejects one outside it, which would stop recording, so a
+  // plan from history outside any turn, such as a share's snapshot, is left out.
+  if (body.update?.sessionUpdate === 'plan_update' && body.turnSequence === undefined) return binding
   const sequence = binding.next
   const line = JSON.stringify({ schemaVersion: 1, sequence, ...body }) + '\n'
   const files: string[] = []
@@ -275,7 +290,8 @@ async function drainPending(host: Host, session: string): Promise<boolean> {
     while (delivering()) {
       const binding = await serial(async () => load(host, session))
       // A conversation that continued in another session delivers from there.
-      if (!binding.thread || !binding.pending.length || binding.continuedIn) return true
+      // A stopped session's queue waits for it to resume.
+      if (!binding.thread || !binding.pending.length || binding.continuedIn || binding.stopped) return true
       // A recovered outbox checks the CLI's contract before its first append, so an incompatible CLI
       // records nothing. An answer that arrives after the session ended or was activated again belongs
       // to that earlier lifetime: it neither appends nor reports, and the current one checks for itself.
@@ -293,7 +309,7 @@ async function drainPending(host: Host, session: string): Promise<boolean> {
         // any other session waits, and drain decides how long to keep asking.
         const state = sessions.get(session)
         const permanent = classifyCommandFailure(error) === 'permanent'
-        if (state && permanent) pauseCheckout(state, 'verification')
+        if (state && permanent && !state.binding?.stopped) pauseCheckout(state, 'verification')
         if (permanent || !recordsOffline(session, binding)) throw error
       }
       const { count, fenced, failure } = await appendPending(host, {
@@ -553,8 +569,10 @@ export async function drain(host: Host, session: string): Promise<void> {
  * Queued records keep their sequence, so an unchanged retry is always safe.
  */
 async function failDelivery(host: Host, session: string, error: unknown): Promise<never> {
-  if (!(error instanceof DeltaCommandError)) throw error
   const state = sessions.get(session)
+  // A stopped session's queue waits for it to resume: a send that outlived the stop says nothing.
+  if (state?.binding?.stopped) throw new DeltaSendError(errorText(error), false)
+  if (!(error instanceof DeltaCommandError)) throw error
   // A session that ended or was replaced must not retry, pause, or speak in the active one's transcript.
   if (!state || activation.session !== session) throw new DeltaSendError(error.message, false)
   const decision = deliveryFailure(state, error, state.pauses.has('verification'))
@@ -722,6 +740,10 @@ export async function startTurn(host: Host, e: HookEvent<'turn.start'>, next: Ho
   await noticeSession(host, session)
   await captureDecided(session)
   const runtime = stateFor(session)
+  if (!runtime.syncReminderDismissed) {
+    runtime.syncReminderDismissed = true
+    host.ui.invalidate()
+  }
   runtime.currentTurnId = e.turnId
   if (runtime.localTurn && !runtime.localTurn.turnId) runtime.localTurn.turnId = e.turnId
   if (!runtime.binding?.snapshot || isLocalTurn(runtime, e.turnId)) return next(e)
@@ -750,19 +772,23 @@ export async function startTurn(host: Host, e: HookEvent<'turn.start'>, next: Ho
  * The main loop's turn ended: stage its finish, then release the remote rows held while it ran, move
  * Claude if it must, and start a share asked for during the turn.
  */
-export async function completeTurn(host: Host, e: HookEvent<'turn.complete'>, next: HookNext<'turn.complete'>) {
+export async function completeTurn(host: Host, e: HookEvent<'turn.complete'>, next: HookNext<'turn.complete'>, prose?: string) {
   const session = await host.session.id()
   const runtime = stateFor(session)
   const sequence = runtime.nativeTurns.get(e.turnId) ??
     (runtime.binding?.execution?.turnId === e.turnId ? runtime.binding.execution.sequence : undefined)
+  const local = isLocalTurn(runtime, e.turnId)
   if (runtime.currentTurnId === e.turnId) runtime.currentTurnId = undefined
-  if (isLocalTurn(runtime, e.turnId)) runtime.localTurn = undefined
+  if (local) runtime.localTurn = undefined
   runtime.promptEntering = false
   runtime.nativeTurns.delete(e.turnId)
   const result = await next(e)
   if (sequence !== undefined) runtime.tools.forgetUnpaired(sequence)
   if (sequence !== undefined) {
-    try { await endExecution(host, session, sequence, () => true, 'bounded', stopReasonOf(e)) }
+    try {
+      await endExecution(host, session, sequence, () => true, 'bounded', stopReasonOf(e))
+      if (!local && prose) void recordThreadSummary(host, session, sequence, prose)
+    }
     catch (error) { await report(host, error) }
   }
   // Release the remote rows held back while this turn ran now that its finish is staged: delivered
@@ -815,9 +841,10 @@ export async function recordRow(host: Host, e: HookEvent<'session.append'>, next
     if (!('deny' in stored) && runtime.binding?.snapshot) {
       const message = capturedMessage(stored.message, e.door)
       if (message) {
-        rememberToolResults(runtime.tools, message)
+        const plans = recordsPlans(session)
+        rememberToolResults(runtime.tools, message, plans)
         const updates = messageUpdates(message, stored.uuid, runtime.tools.structuredResults,
-          { root: boundDirectory(runtime.binding), omitted: runtime.tools.omitted }).map(liveActivity)
+          { root: boundDirectory(runtime.binding), omitted: runtime.tools.omitted, plans }).map(liveActivity)
         // Output from the turn Claude is running waits for that turn's scoped start record, so
         // it names its own turn rather than the turn before it. The prompt starting a turn is
         // held the same way, because its start record is written after its row.
@@ -863,7 +890,7 @@ export async function recordToolCall(host: Host, e: HookEvent<'tool.call'>, next
   const turnSequence = contentTurn(runtime)
   if (e.tool_use_id && turnSequence !== undefined) runtime.tools.toolTurns.set(e.tool_use_id, turnSequence)
   const hold = turnSequence === undefined && runtime.currentTurnId !== undefined
-  if (e.tool_use_id && isOmittedTool(e.tool)) runtime.tools.omitted.add(e.tool_use_id)
+  if (e.tool_use_id && isOmittedTool(e.tool, recordsPlans(session))) runtime.tools.omitted.add(e.tool_use_id)
   try {
     const result = await next(e)
     await waitForSnapshot()

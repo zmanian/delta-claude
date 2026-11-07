@@ -30,7 +30,7 @@ import {
 } from '../cli/thread-commands'
 import { errorText } from '../core/text'
 import { restoreChildren } from '../subagents/thread-runs'
-import { FS_READ_LIMIT, readFrom, recordTitle } from '../recording/title'
+import { awaitsTitle, FS_READ_LIMIT, readFrom, recordTitle } from '../recording/title'
 import { claudeConfigDir, expectedTranscript, findTranscript } from '../core/transcript'
 import { followUpload, startConversation, stopConversation } from '../watch/watch'
 
@@ -42,6 +42,11 @@ export let outbox = ''
 /** Automatic activation has not finished: the binding exposes its thread only once every step succeeded. */
 export function activationIncomplete(runtime: SessionState): boolean {
   return !!runtime.binding?.autoUpload && !runtime.binding.thread
+}
+
+/** Wait for a creation already in progress before reading a completed turn's metadata. */
+export async function awaitAutomaticActivation(session: string) {
+  await autoActivating.get(session)
 }
 
 /**
@@ -91,6 +96,8 @@ export async function activate(host: Host, session: string, isCurrent = () => tr
       await report(host, new Error(`The join directory transition is incomplete. Run /delta-join ${binding.joinTransition.locator} to retry the saved mount${binding.directory ? ` at ${binding.directory}` : ''}; prompts remain blocked.`))
       return
     }
+    // A session `/delta stop` paused keeps its thread but starts nothing until it is resumed.
+    if (binding.stopped) return
     // A session Desktop started in a hand-off's folder joins it before its first prompt.
     if (!binding.snapshot && !binding.joined && !runtime.handoffClaim) {
       const handoff = await pendingHandoff(host, await host.session.cwd())
@@ -193,8 +200,8 @@ const noticing = new Map<string, Promise<boolean>>()
 /** How often a session's transcript was looked for and not found, which stops the looking at {@link MAX_TRANSCRIPT_MISSES}. */
 const transcriptMisses = new Map<string, number>()
 const MAX_TRANSCRIPT_MISSES = 3
-/** The turn whose reply last looked for an untitled session's title, so a long turn reads its transcript once. */
-const titleTurns = new Map<string, string | undefined>()
+/** Each session's latest {@link pollTitle}, so a newer turn's polling replaces an older one's. */
+const titlePolls = new Map<string, object>()
 
 /**
  * `session.start` ran for a session, which has been activated by now: work out how it started. A session
@@ -252,6 +259,8 @@ async function decideStart(host: Host, session: string): Promise<boolean> {
   }
   sessionStarts.set(session, source)
   startedSession = session
+  // Clearing or switching conversations is not another launch of Claude.
+  if (after) stateFor(session).syncReminderDismissed = true
   if (after === 'join') return false
   // A join, running or done, as a hand-off's is by now, decides what its session records.
   if (newSessionFor(session) && !requests.join && !sessions.get(session)?.binding?.joined) beginCaptureDecision(session)
@@ -301,8 +310,9 @@ async function beginSession(host: Host, session: string) {
 }
 
 /**
- * Remember where a turn left the transcript and its title. Looking for the file stops after a few
- * misses, as a session that keeps no transcript would otherwise search for it at every turn.
+ * Remember where the session's transcript is now, and record the title it holds. Looking for the file
+ * stops after a few misses, as a session that keeps no transcript would otherwise search for it at
+ * every turn.
  */
 export async function followTranscript(host: Host, session: string) {
   if ((transcriptMisses.get(session) ?? 0) >= MAX_TRANSCRIPT_MISSES) return
@@ -316,24 +326,37 @@ export async function followTranscript(host: Host, session: string) {
 }
 
 /**
- * Read an untitled recorded session's title at the first reply of each turn. Claude writes a session's
- * title before its first reply, so the thread is named during that turn rather than at its end. Once a
- * title is recorded, only a turn's end reads again, for a later one such as a `/rename`.
+ * How long to wait before each read of an untitled session's transcript after a turn starts. Claude
+ * writes the title it chose about two seconds after the first prompt, whatever the reply, and never
+ * changes it; reading only at a reply or a turn's end would leave the thread unnamed for the whole
+ * first reply. No hook reports the title, so the transcript is read on this schedule instead.
  */
-export async function followTitle(host: Host, session: string) {
-  const runtime = stateFor(session)
-  const binding = runtime.binding
-  if (!binding?.snapshot || binding.joined || binding.title !== undefined) return
-  if (titleTurns.has(session) && titleTurns.get(session) === runtime.currentTurnId) return
-  titleTurns.set(session, runtime.currentTurnId)
-  await followTranscript(host, session)
+export const TITLE_POLL_DELAYS_MS = [1000, 1000, 1000, 2000, 4000, 8000, 16000]
+
+/**
+ * Read a recorded session's transcript for its title on {@link TITLE_POLL_DELAYS_MS} after a turn
+ * starts, until the thread has a title from it. Polling stops when the session ends, another is
+ * recorded, or a later turn starts polling of its own.
+ */
+export async function pollTitle(host: Host, session: string) {
+  if (!awaitsTitle(session)) return
+  const poll = {}
+  titlePolls.set(session, poll)
+  const active = stillActive(session)
+  for (const delay of TITLE_POLL_DELAYS_MS) {
+    await host.clock.sleep(delay)
+    if (titlePolls.get(session) !== poll || !active() || !awaitsTitle(session)) break
+    // A failed look is as good as finding nothing; the next one tries again.
+    try { await followTranscript(host, session) } catch {}
+  }
+  if (titlePolls.get(session) === poll) titlePolls.delete(session)
 }
 
 /** A session that ended forgets how it started and its open setup offer, and releases its capture boundary. */
 export async function forgetSessionStart(host: Host, session: string, reason: string) {
   sessionStarts.delete(session)
   transcriptMisses.delete(session)
-  titleTurns.delete(session)
+  titlePolls.delete(session)
   // Claude starts the session after this one with no `session.start`, so the reason it ended says how.
   endedSession = session
   startedSession = undefined
@@ -397,7 +420,8 @@ export async function continuedFrom(host: Host, session: string): Promise<Bindin
   for (const storeKey of keys) {
     if (!storeKey.startsWith('session:') || storeKey === key(session)) continue
     const candidate = await storedBinding(host, storeKey)
-    if (!candidate?.thread || !candidate.snapshot) continue
+    // A conversation `/delta stop` paused is continued too, and stays paused in its new session.
+    if (!candidate?.thread || !(candidate.snapshot || candidate.stopped)) continue
     if (candidate.continuedIn === session) return candidate
     if (candidate.continuedIn || !candidate.transcript) continue
     if (candidate.endedAt !== undefined && candidate.endedAt < now - CONTINUATION_HORIZON_MS) continue
@@ -519,6 +543,12 @@ export async function startSession(host: Host, session: string, loadedMidSession
     }
     if (policy.problem)
       await notifyOnce(host, `Delta settings at ${path} couldn't be used (${policy.problem}). Until it's fixed, only sessions you share with /delta-share sync. Run /delta-setup to replace it.`)
+    // Delta records a session it runs over ACP in its own thread, so recording it here would add a
+    // second thread. Delta's app sets this; a `claude` started in Delta's terminal doesn't have it.
+    if (newSession && recordsAutomatically(policy) && await host.env.deltaAcpSession()) {
+      await host.ui.log('Delta: Delta records this ACP session itself, so this session is not recorded automatically.', { to: 'debug' })
+      return
+    }
     if (newSession && recordsAutomatically(policy) && await joinedBindingAt(host, root))
       await notifyOnce(host, `${root} is a worktree of a Delta thread a Claude session joined, so this session isn't recorded automatically. Run /delta-join with that thread's link to record in it.`)
     else if (newSession && recordsAutomatically(policy))
@@ -588,7 +618,7 @@ export const autoActivating = new Map<string, Promise<void>>()
  * The session's capture boundary is released once the contract gate and snapshot are settled, before
  * any network step, so a prompt or turn that arrives during create or attach is recorded
  * rather than dropped. Every await re-checks ownership: a session that ended, or that switched away
- * while a step was pending, leaves no half-initialized binding behind.
+ * while a step was pending, leaves its durable setup progress for a later recovery.
  */
 function activateAutomatically(host: Host, session: string, root: string, upload: AutoUpload): Promise<void> {
   const running = autoActivating.get(session)
@@ -601,6 +631,10 @@ function activateAutomatically(host: Host, session: string, root: string, upload
     if (!ownsActivation()) return
     // A session that already holds a thread, or a binding that is not ours, is never re-created.
     if (existing.thread || (existing.snapshot && !existing.autoUpload) || existing.joined || existing.joinTransition) return
+    if (existing.pendingActivation?.refusal) {
+      finishProgress(host, existing.pendingActivation.refusal.band, 'error')
+      return
+    }
     // A fresh session checks the account against the policy alongside the contract, so a repository
     // this account cannot record to is reported before anything is staged.
     const misconfiguration = existing.snapshot ? undefined : policyMisconfiguration(host, upload.organization)
@@ -664,11 +698,14 @@ function activateAutomatically(host: Host, session: string, root: string, upload
         }
       }
       setProgress(host, 'Connecting this session to Delta…', 'active')
-      const created = await threadCreate(host, {
+      const thread = existing.pendingActivation?.thread ?? (await threadCreate(host, {
         externalId: session, organization: { id: upload.organization, visibility: upload.mode },
-      })
+      })).thread_id
       if (!ownsActivation()) return
-      const reference = await attachWorktree(host, root, created.thread_id, existing.checkoutReference, undefined, session)
+      // Keep creation durable without exposing the thread to delivery before its checkout is ready.
+      await serial(async () => save(host, { ...await load(host, session), pendingActivation: { thread } }))
+      if (!ownsActivation()) return
+      const reference = await attachWorktree(host, root, thread, existing.checkoutReference, undefined, session)
       if (!ownsActivation()) return
       await serial(async () => save(host, { ...await load(host, session), checkoutReference: reference, pendingWorktree: undefined }))
       await mountCheckout(host, { session, checkout: root, checkoutReference: reference }, async () => {
@@ -677,7 +714,7 @@ function activateAutomatically(host: Host, session: string, root: string, upload
       if (!ownsActivation()) return
       // Every step succeeded: now the thread and checkout become visible to drain and verification.
       await serial(async () => save(host, {
-        ...await load(host, session), thread: created.thread_id, checkout: root, checkoutReference: reference,
+        ...await load(host, session), thread, checkout: root, checkoutReference: reference, pendingActivation: undefined,
       }))
       if (!ownsActivation()) return
       runtime.binding = await serial(() => load(host, session))
@@ -753,9 +790,9 @@ function activationRefusal(error: unknown, organization: string): ActivationRefu
 }
 
 /**
- * End automatic recording for a session the policy cannot record: drop any staged binding and its
- * outbox, so the session is simply manual again and nothing retries or grows, then report why. A
- * later /delta share exports the whole conversation from Claude's transcript, so nothing is lost.
+ * Stop automatic setup on a permanent refusal. Before creation, discard the staged binding and
+ * outbox; after creation, preserve setup progress and queued records for explicit /delta-share
+ * recovery, without retrying automatically or allowing delivery into an unmounted checkout.
  *
  * The band shows the refusal for the whole session. The transcript explains it once per repository
  * and refusal, remembered in the store, so every new session in a misconfigured repository stays quiet.
@@ -764,6 +801,10 @@ async function stopAutomaticRecording(host: Host, session: string, root: string,
   await serial(async () => {
     const binding = await load(host, session)
     if (!binding.autoUpload || binding.thread) return
+    if (binding.pendingActivation) {
+      await save(host, { ...binding, pendingActivation: { ...binding.pendingActivation, refusal } })
+      return
+    }
     await host.store.delete(key(session))
     const runtime = stateFor(session)
     runtime.binding = await load(host, session)
@@ -806,7 +847,7 @@ async function pruneStore(host: Host) {
     if (sessions.has(id)) continue
     const binding = await storedBinding(host, key(id))
     if (typeof binding?.endedAt !== 'number' || binding.endedAt > now - STORE_HORIZON_MS ||
-        binding.pending?.length || binding.captureFailure || binding.joinTransition) continue
+        binding.pending?.length || binding.captureFailure || binding.joinTransition || binding.pendingActivation) continue
     // A subagent's undelivered records keep its session, like the session's own.
     const recorded = await Promise.all((binding.children ?? []).map((agentId) =>
       storedChildBinding(host, id, agentId)))

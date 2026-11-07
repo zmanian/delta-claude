@@ -1,5 +1,5 @@
 import type { EngineInterface, HookFailure, On } from 'claude-code'
-import { activate, followTitle, followTranscript, forgetSessionStart, noticeStart } from './setup/activation'
+import { activate, followTranscript, forgetSessionStart, noticeStart, pollTitle } from './setup/activation'
 import { clearProgress, drawBand, forgetBarTheme } from './band/band'
 import {
   DELTA_USAGE, deltaMenu, installationUpdates, installUpdateHost, JOIN_USAGE, ORG_USAGE, registerCommands,
@@ -27,6 +27,8 @@ import { errorText } from './core/text'
 import { isAgentTool } from './subagents/children'
 import { forgetThreadNotes, sendToThread } from './subagents/thread-runs'
 import { forgetTitleReader } from './recording/title'
+import { forgetThreadSummaryFailure } from './recording/thread-summary'
+import { completedTurn, rememberTurn } from './recording/thread-summary'
 import { stopWatching } from './watch/watch'
 
 /**
@@ -44,10 +46,7 @@ async function logHookFailure($: EngineInterface, hook: string, failure: HookFai
 
 function recordAppended($: EngineInterface, e: HookEvent<'session.append'>, next: HookNext<'session.append'>) {
   const host = hostOf($)
-  if (e.agentId !== undefined) return recordChildRow(host, e, e.agentId, next)
-  // A reply's row never waits for the title, and reading it cannot fail the row.
-  if (e.door === 'response') void host.session.id().then((session) => followTitle(host, session)).catch(() => {})
-  return recordRow(host, e, next)
+  return e.agentId !== undefined ? recordChildRow(host, e, e.agentId, next) : recordRow(host, e, next)
 }
 
 /**
@@ -79,6 +78,7 @@ function hostOf($: EngineInterface): Host {
     env: {
       claudeCodeRemote: () => $.env.get('CLAUDE_CODE_REMOTE'),
       claudeConfigDir: () => $.env.get('CLAUDE_CONFIG_DIR'),
+      deltaAcpSession: () => $.env.get('DELTA_ACP_SESSION'),
       disableNonessentialTraffic: () => $.env.get('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC'),
       home: () => $.env.get('HOME'),
       os: () => $.env.get('OS'),
@@ -93,6 +93,9 @@ function hostOf($: EngineInterface): Host {
     },
     http: {
       fetch: (url, init) => $.http.fetch(url, init),
+    },
+    model: {
+      complete: (request) => $.model.complete(request),
     },
     plugin: {
       name: $.plugin.name,
@@ -163,19 +166,25 @@ export function register(on: On) {
   // Claude 2.1.299+ raises turn.start inside a child agent's or teammate's own loop, with `agentId`
   // set. That loop is not the shared conversation: only the main loop's turns may bind
   // `currentTurnId` or open an execution. A recorded subagent's turn is its own thread's.
-  on('turn.start', ($, e, next) => {
+  on('turn.start', async ($, e, next) => {
     const host = hostOf($)
-    return e.agentId !== undefined
-      ? startChildTurn(host, e, e.agentId, next) : startTurn(host, e, next)
+    rememberTurn(e.turnId, e.text)
+    if (e.agentId !== undefined) return startChildTurn(host, e, e.agentId, next)
+    const result = await startTurn(host, e, next)
+    // Claude names a session in its transcript file, not through any hook, soon after a prompt and
+    // whatever the reply, so an untitled session's transcript is read while the turn runs. The turn
+    // never waits for it, and it can fail nothing.
+    void $.session.id().then((session) => pollTitle(host, session)).catch(() => {})
+    return result
   })
 
   on('turn.complete', async ($, e, next) => {
     const host = hostOf($)
-    if (e.agentId !== undefined) return completeChildTurn(host, e, e.agentId, next)
-    const result = await completeTurn(host, e, next)
-    // Claude names a session in its transcript file, not through any hook, so the title is read there
-    // when a turn ends: the title Claude chose for the first prompt, or a `/rename` made since. A turn's
-    // end never waits for the transcript or its title, and neither can fail it.
+    const prose = completedTurn(e.turnId, e.answer)
+    if (e.agentId !== undefined) return completeChildTurn(host, e, e.agentId, next, prose)
+    const result = await completeTurn(host, e, next, prose)
+    // A turn's end reads the transcript again, for a title the turn's polling missed or a rename made
+    // somewhere `/rename` does not reach this plugin. It never waits for the read, which can fail nothing.
     void $.session.id().then((session) => followTranscript(host, session)).catch(() => {})
     return result
   })
@@ -214,6 +223,7 @@ export function register(on: On) {
     await stopWatching(session)
     forgetContract(session)
     forgetTitleReader(session)
+    forgetThreadSummaryFailure(session)
     forgetThreadNotes(session)
     // A joined or shared session keeps reporting through its transition; an ordinary end clears it.
     if (!requests.join && !requests.share) clearProgress(host)
@@ -258,6 +268,15 @@ export function register(on: On) {
     return result
   })
 
+  // `/rename`, with a name or without one for Claude to choose, writes the new title to the transcript
+  // before it returns, so the thread is renamed at once rather than when the next turn ends.
+  on('command.run', { command: 'rename' }, async ($, e, next) => {
+    const host = hostOf($)
+    const result = await next(e)
+    void $.session.id().then((session) => followTranscript(host, session)).catch(() => {})
+    return result
+  }).catch(async ($, e, next) => { await logHookFailure($, '/rename', next.error); return next(e) })
+
   on('command.run', { command: 'delta' }, async ($, e) => {
     const host = hostOf($)
     const action = e.args.trim()
@@ -275,6 +294,13 @@ export function register(on: On) {
     const host = hostOf($)
     return runDeltaCommand(host, `share ${e.args.trim()}`.trim(), 'dedicated_command')
   }).catch(async ($, e, next) => { await logHookFailure($, '/delta-share', next.error); return next(e) })
+  on('command.run', { command: 'delta-unshare' }, async ($, e) => {
+    const host = hostOf($)
+    return runDeltaCommand(host, `unshare ${e.args.trim()}`.trim(), 'dedicated_command')
+  }).catch(async ($, _e, next) => {
+    await logHookFailure($, '/delta-unshare', next.error)
+    return { text: 'Delta could not make this thread private. Retry /delta-unshare.' }
+  })
   // Typed without its argument, a command asks for it instead of failing.
   on('command.run', { command: 'delta-join' }, async ($, e) => {
     const host = hostOf($)

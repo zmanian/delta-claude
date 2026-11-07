@@ -19,6 +19,8 @@ export type Host = {
   env: {
     claudeCodeRemote(): Promise<string | undefined>
     claudeConfigDir(): Promise<string | undefined>
+    /** Set when Delta runs this session over ACP and records it itself. */
+    deltaAcpSession(): Promise<string | undefined>
     disableNonessentialTraffic(): Promise<string | undefined>
     home(): Promise<string | undefined>
     os(): Promise<string | undefined>
@@ -28,6 +30,7 @@ export type Host = {
     read(path: string): Promise<string>
   }
   http: Pick<EngineInterface['http'], 'fetch'>
+  model: Pick<EngineInterface['model'], 'complete'>
   plugin: Pick<EngineInterface['plugin'], 'name' | 'root'>
   process: Pick<EngineInterface['process'], 'run' | 'spawn'>
   prompt: Pick<EngineInterface['prompt'], 'submit'>

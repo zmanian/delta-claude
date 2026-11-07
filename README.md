@@ -106,9 +106,13 @@ Run `/delta-stop` to stop syncing a repository's sessions without losing its set
 New sessions there don't sync, even under Private sync or Team sharing, until you run
 `/delta-start`, which returns to the saved setting. The stop is saved to
 `.delta/settings.json` as `"stopped": true` under `threads`, so it lasts across
-sessions and restarts. A session that is already syncing keeps syncing until it ends,
-and `/delta-share` still syncs a session when you ask. Choosing a setting in
-`/delta-setup` also starts sync again.
+sessions and restarts. The session you run it in pauses too: it first sends what it
+recorded, then stops recording, watching and syncing its checkout, and keeps its
+thread. `/delta-start`, or `/delta-share` in that session, resumes it into the same
+thread; what was said while it was paused stays out. A session that joined someone's
+shared thread keeps syncing until it ends, and a session in the middle of a turn,
+share or join, or one still running a subagent, asks you to try again once that
+finishes. Choosing a setting in `/delta-setup` also starts sync again for new sessions.
 
 If automatic sync needs you to sign in, an interactive session asks before opening
 your browser. If Delta's beta terms still need accepting, it offers to open them too.
@@ -120,6 +124,8 @@ Headless sessions never open a browser.
 
 `/delta-share` asks who should see the session: your team, just you, or people
 you name by email address. `/delta-share ada@example.com` invites them directly.
+`/delta-unshare` makes the current thread private without stopping sync. People
+invited explicitly retain access.
 
 ### Commands
 
@@ -129,10 +135,11 @@ its own opens a menu of these actions.
 | Command | Description |
 | --- | --- |
 | `/delta-share [<email>…]` | Sync the current session and its checkout, and choose who sees it |
+| `/delta-unshare` | Make the current thread private while keeping sync and explicit invitations |
 | `/delta-join <link>` | Join a shared thread in a fresh session, in the thread's checkout |
 | `/delta-setup` | Choose this repository's team and which sessions sync |
-| `/delta-stop` | Stop syncing new sessions in this repository, and remember it |
-| `/delta-start` | Resume syncing this repository after `/delta-stop` |
+| `/delta-stop` | Stop syncing this session and new sessions in this repository, and remember it |
+| `/delta-start` | Resume syncing this session and this repository after `/delta-stop` |
 | `/delta-update` | Update the installed Delta app and CLI |
 | `/delta-plugin-update [check \| notifications on\|off]` | Update the Claude Code plugin and reload, check its version, or control update notifications |
 | `/delta-org list` | List your Delta teams |
@@ -150,6 +157,15 @@ inputs and outputs and Claude's thinking, plus the files in your checkout
 (staged, unstaged, and untracked files that aren't ignored). Nothing is uploaded
 until you share or join a session, or the repository's setting syncs it
 automatically.
+
+After a recorded turn, the plugin asks Claude Code's `haiku` model to summarize
+the turn and maintain a short search summary. It sends bounded turn prose
+and the previous description through your Claude Code session's credentials,
+not Delta's inference configuration. This uses your Claude plan, API, or configured
+provider and may be unavailable if Haiku is blocked or rate-limited. A summary
+that cannot finish before Claude Code exits is omitted; recording still works.
+The generated title is separate from your visible thread title and never replaces
+a manual rename.
 
 A shared or joined session shows you as connected through Claude Code. An open
 Delta view takes precedence.

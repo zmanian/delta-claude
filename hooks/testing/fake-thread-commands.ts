@@ -5,12 +5,14 @@ import type { ThreadState, ThreadUser, WatchChild, WatchComment, WatchItem } fro
 import { cliErrorCodes, cliFixture } from './cli-fixtures'
 import { MINIMUM_CLAUDE_VERSION } from '../core/compatibility'
 import { samePath } from '../core/paths'
+import { transcriptCandidate } from '../core/transcript'
 import { showAnswer } from '../watch/row-delivery'
 
 export type Envelope = {
   schemaVersion: 1
   sequence: number
   update?: Record<string, any>
+  summary?: Record<string, any>
   turnSequence?: number
 }
 export type Disposition = 'recorded' | 'fenced' | 'duplicate'
@@ -439,6 +441,8 @@ export function fakeThreads(hostOn: On, options: {
       /** The mounted checkouts of each owner that asked for them, and the directory each was told to work in. */
       groups: new Map<string, { directory: string; mounts: Map<string, { name: string; directory: string; active: boolean }> }>(),
       shared: false,
+      /** Cloud visibility can differ from the upload intent after an unshare. */
+      visibility: undefined as 'private' | 'organization' | undefined,
       /** Every address `thread invite` sent, in order. */
       invited: [] as string[],
       /** The upload intent `thread create` recorded, before or after the thread registers with the cloud. */
@@ -536,6 +540,8 @@ export function fakeThreads(hostOn: On, options: {
     /** Patches every ready frame, e.g. to simulate a different conversation. */
     readyPatch: undefined as Record<string, unknown> | undefined,
     statusPatch: undefined as Record<string, unknown> | undefined,
+    summaryReply: undefined as string | undefined,
+    summaryRequests: [] as { model: string; prompt: string }[],
     worktreeItems: undefined as Extract<ThreadState['worktrees'], { status: 'available' }>['items'] | undefined,
     mountReply: undefined as ((owner: string) => Record<string, any>) | undefined,
     attachmentPatch: undefined as Record<string, unknown> | undefined,
@@ -582,6 +588,8 @@ export function fakeThreads(hostOn: On, options: {
     holdCliResolution: undefined as (() => Promise<void> | undefined) | undefined,
     /** Reading a transcript from an offset cannot start, as without `tail` or a usable PowerShell. */
     failTranscriptRead: false,
+    /** A transcript read that has read the file waits for this before it prints anything. */
+    holdTranscriptRead: undefined as Promise<void> | undefined,
     failWrite: false,
     /** `git rev-parse` fails, as outside a checkout. */
     failGit: false,
@@ -599,7 +607,8 @@ export function fakeThreads(hostOn: On, options: {
     gitCommonDir: `${CHECKOUT}/.git`,
     failStoreSet: false as boolean | (() => boolean),
     failRemoval: false,
-    holdListing: undefined as Promise<void> | undefined,
+    /** Holds listing the outbox, as a blocked collector sees it; other folders list at once. */
+    holdOutboxListing: undefined as Promise<void> | undefined,
     /** Pauses `process.run` for the named operations, so a test can read the band mid-step. */
     holdRun: undefined as ((operation: string | undefined) => Promise<void> | undefined) | undefined,
     /** Pauses the initial API export, between its fetch and its staging. */
@@ -650,7 +659,7 @@ export function fakeThreads(hostOn: On, options: {
           state: shared || fake.server.registered ? 'granted' : 'local_only',
           is_owner: shared || fake.server.registered ? true : null,
         },
-        visibility: shared ? 'organization' : upload && fake.server.registered ? upload.visibility : null,
+        visibility: fake.server.visibility ?? (shared ? 'organization' : upload && fake.server.registered ? upload.visibility : null),
         upload: upload ? {
           state: fake.server.uploadFailure ? 'failed'
             : fake.server.confirmed ? 'uploaded'
@@ -900,10 +909,18 @@ export function fakeThreads(hostOn: On, options: {
       await fake.endSession?.(fake.session)
       fake.session = `${fake.session}-fresh`
     } else if (e.command === 'cd' && !fake.refuseCd) fake.cwd = e.args
+    else if (e.command === 'rename') {
+      // Claude writes the new title, or one it chose when none was typed, before the command returns.
+      const title = e.args.trim() || 'chosen-by-claude'
+      const transcript = transcriptCandidate(CONFIG, fake.cwd, fake.session)
+      fake.files.set(transcript, (fake.files.get(transcript) ?? '') +
+        JSON.stringify({ type: 'custom-title', customTitle: title, sessionId: fake.session }) + '\n')
+      return { text: `Session renamed to: ${title}` }
+    }
     else if (e.command === 'reload-plugins') {
       if (fake.reloadFailure) throw new Error(fake.reloadFailure)
       if (fake.reloadResponse !== undefined) return { text: fake.reloadResponse }
-    } else if (!['clear', 'cd'].includes(e.command)) throw new Error(`Unexpected fixture session command ${e.command}`)
+    } else if (!['clear', 'cd', 'rename'].includes(e.command)) throw new Error(`Unexpected fixture session command ${e.command}`)
     return {}
   })
   // The settings menu's rows, of which the band reads the theme for its status bar's shade.
@@ -921,6 +938,13 @@ export function fakeThreads(hostOn: On, options: {
     if (fake.holdExport) await fake.holdExport
     fake.exports++
     return { value: fake.messages }
+  })
+  on('model.complete', ($, e) => {
+    fake.summaryRequests.push({ model: e.model, prompt: e.prompt })
+    return { value: {
+      isAnswered: true, text: fake.summaryReply ?? '{"summary":"Finished","threadSearchSummary":null}',
+      usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+    } }
   })
   on('session.compact', () => ({ messages: [{ role: 'user', text: 'Compacted summary', toolUses: [] }] }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
@@ -1033,7 +1057,7 @@ export function fakeThreads(hostOn: On, options: {
     [...fake.files.keys()].some((path) => path === fixturePath(e.path) || path.startsWith(`${fixturePath(e.path)}/`)) }))
   on('fs.list', async ($, e) => {
     fake.listed.push(e.path)
-    if (fake.holdListing) await fake.holdListing
+    if (fake.holdOutboxListing && e.path.includes('/delta-plugin/outbox')) await fake.holdOutboxListing
     const prefix = `${fixturePath(e.path)}/`
     const below = [...fake.files.keys()].filter((path) => path.startsWith(prefix)).map((path) => path.slice(prefix.length))
     // A file deeper down makes a folder here, listed once.
@@ -1123,12 +1147,16 @@ export function fakeThreads(hostOn: On, options: {
         message: `Delta plugin ${fake.pluginInstalledVersion} is installed.` }))
     }
     if (argv[0] === 'where.exe') return output(`${WINDOWS_DELTA}\r\n`)
+    // Discovery asks a CLI found on PATH whether it is Delta before selecting it.
+    if (argv[0] === WINDOWS_DELTA && argv.slice(1).join(' ') === '--json thread contract')
+      return output(JSON.stringify(cliFixture('contract', {})))
     if (argv[0] === 'sh') {
       const discovery = !argv[2]?.includes('--non-interactive')
       if (discovery && e.init?.timeoutMs === 5_000) fake.updateDiscoveries++
       else fake.cliSetups.push(discovery ? 'discover' : 'install')
       await fake.holdCliSetup?.(!discovery)
-      if (discovery) return fake.cliMissing ? output('', 3) : output('/selected/delta\n')
+      // The fake's CLI sits at an install location, which discovery selects without probing it.
+      if (discovery) return fake.cliMissing ? output('') : output('installed /selected/delta\n')
       fake.cliMissing = false
       return output('/selected/delta\n')
     }
@@ -1270,6 +1298,13 @@ export function fakeThreads(hostOn: On, options: {
         return output(JSON.stringify(cliFixture('error', faultEnvelope({ code: 'worktree_invalid_reference', message: 'unknown worktree' }))), 2)
       }
       const reference = `${local}#t=0`
+      if (!child && fake.server.mount?.thread === thread &&
+          samePath(fake.server.mount.directory, checkout!.directory) &&
+          fake.server.mount.reference.split('#')[0] !== local)
+        return output(JSON.stringify(cliFixture('error', faultEnvelope({
+          code: 'failed', reason: 'worktree_conflict', retryable: false,
+          message: 'the thread already has a worktree from this Git checkout',
+        }))), 2)
       if (child) child.checkout = { directory: checkout?.directory ?? CHECKOUT, reference }
       else {
         fake.server.mount = { thread, directory: checkout!.directory, reference }
@@ -1307,13 +1342,14 @@ export function fakeThreads(hostOn: On, options: {
     }
     const options = operation === 'attach' ? { '--thread': fake.server.thread }
       : operation === 'share' ? { '--visibility': 'organization' }
+      : operation === 'unshare' ? {}
       : operation === 'fork' || operation === 'discard' ? { ...operation === 'discard' ? { '--force': true as any } : {} }
       : operation === 'append' ? { ...source, '--producer-name': 'Claude Code' }
       : source
     // Create carries its upload intent for an automatic session, and omits it for an explicit share.
     const optional = operation === 'append' ? ['--acknowledge']
       : operation === 'create' ? ['--organization', '--visibility'] : []
-    if (!['create', 'attach', 'share', 'status', 'append', 'fork', 'discard'].includes(operation ?? '') ||
+    if (!['create', 'attach', 'share', 'unshare', 'status', 'append', 'fork', 'discard'].includes(operation ?? '') ||
         !matchesCommand(argv, [operation === 'attach' ? 'worktree' : 'thread', operation, ...positionals], options, optional)) {
       fake.violations.push(`forbidden command: ${argv.join(' ')}`)
       throw new Error(`forbidden command ${argv.join(' ')}`)
@@ -1353,9 +1389,21 @@ export function fakeThreads(hostOn: On, options: {
     }
     if (operation === 'share') {
       fake.server.shared = true
+      fake.server.visibility = 'organization'
       return fault ? failed() : output(JSON.stringify(cliFixture('share', {
         thread_id: thread, url: urlOf(), ...fake.publicationPatch,
       })))
+    }
+    if (operation === 'unshare') {
+      if (!fake.server.registered && !fake.server.shared)
+        return output(JSON.stringify(cliFixture('error', faultEnvelope({
+          code: 'not_shared', message: 'this thread has no Cloud record to unshare',
+        }))), 2)
+      if (fault && !fault.after) return failed()
+      fake.server.shared = false
+      fake.server.registered = true
+      fake.server.visibility = 'private'
+      return fault ? failed() : output(JSON.stringify({ operation: 'unshared', thread_id: thread, visibility: 'private' }))
     }
     if (operation === 'status') {
       const result = statusReply()
@@ -1425,6 +1473,7 @@ export function fakeThreads(hostOn: On, options: {
       fake.commands.push([...e.argv])
       if (fake.failTranscriptRead) throw new Error('spawn tail ENOENT')
       const text = fake.files.get(e.argv[3]!)
+      if (fake.holdTranscriptRead) await fake.holdTranscriptRead
       if (text === undefined) {
         yield { stream: 'stderr', text: `tail: ${e.argv[3]}: No such file or directory` }
         return { value: { code: 1, signal: null } }

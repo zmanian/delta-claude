@@ -93,7 +93,23 @@ export type SetupEnv = {
    * it cannot start now.
    */
   shareSession(audience: 'private' | 'organization'): Promise<boolean>
+  /** Pause this session's sync now, as `/delta stop` does; see {@link SessionStop}. */
+  stopSession(): Promise<SessionStop>
+  /** Resume this session's sync into its thread after `/delta stop`; see {@link SessionResume}. */
+  resumeSession(): Promise<SessionResume>
 }
+
+/** What resuming a stopped session did: `none` when it wasn't stopped, or `refused` with why it stays stopped. */
+export type SessionResume = { kind: 'none' } | { kind: 'resumed' } | { kind: 'refused'; reason: string }
+
+/**
+ * What pausing a session's sync did: `none` when it wasn't syncing, `stopped` with how many recorded
+ * rows hadn't reached Delta yet and wait for it to resume, or `refused` with why it keeps syncing.
+ */
+export type SessionStop =
+  | { kind: 'none' }
+  | { kind: 'stopped'; queued: number }
+  | { kind: 'refused'; reason: string }
 
 /** Validate the parsed body of `delta --json org list`, keeping the CLI's typed error envelope. */
 export function organizationsFrom(result: JsonObject): Organization[] {
@@ -605,40 +621,69 @@ async function askOnboarding(env: SetupEnv, interaction: Interaction): Promise<'
 export type StopOutcome = { status: 'wrote' | 'unchanged' | 'failed'; text: string }
 
 /**
- * Stop automatic sync for this checkout: save `threads.stopped` in its settings, keeping the mode and
- * team so `/delta start` returns to them. New sessions here then sync only through `/delta-share`. A
- * session that already syncs keeps syncing until it ends, since its thread and checkout are live.
+ * Stop sync for this checkout and this session: save `threads.stopped` in the checkout's settings,
+ * keeping the mode and team so `/delta start` returns to them, then stop the session's own sync. New
+ * sessions here then sync only through `/delta-share`. A repository already stopped still stops a
+ * session that syncs, as one started before the stop or shared since.
  */
 export async function stopSync(env: SetupEnv): Promise<StopOutcome> {
   const file = await readPolicyFor(env, '/delta-stop')
   if ('status' in file) return file
-  if (file.policy.stopped)
-    return { status: 'unchanged', text: 'Delta sync is already stopped for this repository. Run /delta-start to resume it.' }
-  const saved = await savePolicy(env, file, serializeStopped(file.document, true))
-  if (saved) return saved
-  const syncing = await env.sessionAudience() !== 'none'
+  const already = file.policy.stopped
+  if (!already) {
+    const saved = await savePolicy(env, file, serializeStopped(file.document, true))
+    if (saved) return saved
+  }
+  const session = await env.stopSession()
+  if (already) {
+    if (session.kind === 'none')
+      return { status: 'unchanged', text: 'Delta sync is already stopped for this repository. Run /delta-start to resume it.' }
+    if (session.kind === 'refused')
+      return { status: 'unchanged', text: `Delta sync is already stopped for this repository, but this session keeps syncing: ${session.reason}.` }
+    return { status: 'wrote', text: `Stopped syncing this session; Delta sync was already stopped for this repository. Run /delta-start to resume it.${queuedNote(session.queued)}` }
+  }
+  const about = session.kind === 'stopped' ? ` This session stopped syncing too.${queuedNote(session.queued)}`
+    : session.kind === 'refused' ? ` This session keeps syncing: ${session.reason}.` : ''
   return {
     status: 'wrote',
-    text: `Stopped Delta sync for this repository and saved it to ${SETTINGS_FILE}. New sessions here won't sync until you run /delta-start; /delta-share still syncs a session when you ask.${syncing ? ' This session keeps syncing until it ends.' : ''}`,
+    text: `Stopped Delta sync for this repository and saved it to ${SETTINGS_FILE}. New sessions here won't sync until you run /delta-start; /delta-share still syncs a session when you ask.${about}`,
   }
 }
 
-/** Undo `/delta stop`: new sessions follow the checkout's saved mode again. */
+/** The note a stop adds when recorded rows hadn't reached Delta yet; they are sent when the session resumes. */
+function queuedNote(count: number): string {
+  if (!count) return ''
+  return count === 1
+    ? " 1 recorded row hadn't reached Delta yet; it's sent when this session resumes."
+    : ` ${count} recorded rows hadn't reached Delta yet; they're sent when this session resumes.`
+}
+
+/** Undo `/delta stop`: new sessions follow the checkout's saved mode again, and a stopped session resumes. */
 export async function startSync(env: SetupEnv): Promise<StopOutcome> {
   const file = await readPolicyFor(env, '/delta-start')
   if ('status' in file) return file
-  if (!file.policy.stopped)
+  if (!file.policy.stopped) {
+    const session = await env.resumeSession()
+    if (session.kind === 'resumed')
+      return { status: 'wrote', text: 'Resumed syncing this session into its thread; what was said while it was stopped stays out.' }
+    if (session.kind === 'refused')
+      return { status: 'unchanged', text: `This session stays stopped: ${session.reason}.` }
     return { status: 'unchanged', text: "Delta sync isn't stopped for this repository. Run /delta-setup to change which sessions sync." }
+  }
   const saved = await savePolicy(env, file, serializeStopped(file.document, false))
   if (saved) return saved
+  const outcome = await env.resumeSession()
+  const session = outcome.kind === 'resumed'
+  const about = session ? ' This session syncs into its thread again; what was said while it was stopped stays out.'
+    : outcome.kind === 'refused' ? ` This session stays stopped: ${outcome.reason}.` : ''
   const resumed = readProjectPolicy(serializeStopped(file.document, false)).policy
   if (!resumed.configured)
-    return { status: 'wrote', text: "Resumed Delta sync for this repository, but it isn't set up yet. Run /delta-setup to choose which sessions sync." }
-  const syncing = await env.sessionAudience() !== 'none'
+    return { status: 'wrote', text: `Resumed Delta sync for this repository, but it isn't set up yet. Run /delta-setup to choose which sessions sync.${about}` }
+  const syncing = session || await env.sessionAudience() !== 'none'
   const how = recordsAutomatically(resumed)
     ? `new sessions sync again (${MODE_NAMES[resumed.mode]}).${syncing ? '' : " This session isn't syncing; run /delta-share to sync it."}`
     : 'sessions sync when you run /delta-share (Manual).'
-  return { status: 'wrote', text: `Resumed Delta sync for this repository: ${how}` }
+  return { status: 'wrote', text: `Resumed Delta sync for this repository: ${how}${about}` }
 }
 
 /** Read the checkout's settings for `command`, or the outcome that explains why it can't. */

@@ -113,6 +113,16 @@ describe('automatic activation', () => {
     fake.expectClean()
   })
 
+  test('a session Delta runs over ACP never activates, since Delta records it in its own thread', async ($, on) => {
+    const fake = fakeThreads(on, { env: { DELTA_ACP_SESSION: '1' } })
+    fake.files.set(POLICY, policy('private', 'org-1'))
+    await startAuto($, fake)
+    expect(fake.server.thread).toBeUndefined()
+    expect(fake.operations()).not.toContain('create')
+    expect(binding(fake)).toBeUndefined()
+    fake.expectClean()
+  })
+
   test('a new session in a stopped repository never activates, and /delta-start lets the next one', async ($, on) => {
     const fake = fakeThreads(on)
     fake.files.set(POLICY, JSON.stringify({ threads: { mode: 'organization', organization: 'org-1', stopped: true } }))
@@ -135,6 +145,73 @@ describe('automatic activation', () => {
     expect(JSON.stringify(result)).toContain('Stopped Delta sync')
     expect(JSON.parse(fake.files.get(POLICY)!)).toEqual({ threads: { mode: 'manual', organization: 'org-1', stopped: true } })
     expect(await reminderKind($)).toBe('stopped')
+    fake.expectClean()
+  })
+
+  /** Run one composer turn with `text`, as Claude does, and let its delivery finish. */
+  async function turn($: Engine, fake: ReturnType<typeof fakeThreads>, id: string, text: string) {
+    await $.prompt.submit(prompt(text))
+    await $.session.append({
+      door: 'prompt', origin: { kind: 'composer' }, uuid: `${id}-prompt`,
+      message: { type: 'user', role: 'user', content: [{ type: 'text', text }] },
+    } as never)
+    await $.turn.start(turnStart(id, text))
+    await fake.settle()
+    await $.turn.complete(turnComplete(id))
+    await fake.settle()
+    await fake.advance(120_000)
+    await fake.settle()
+  }
+  const recorded = (fake: ReturnType<typeof fakeThreads>, text: string) =>
+    fake.updates().some((record) => JSON.stringify(record.update).includes(text))
+
+  test('/delta stop pauses a session that syncs, and /delta start resumes it into the same thread', async ($, on) => {
+    const fake = fakeThreads(on)
+    fake.files.set(POLICY, policy('private', 'org-1'))
+    await startAuto($, fake)
+    const thread = binding(fake).thread
+    await turn($, fake, 'native-before', 'before the stop')
+    expect(recorded(fake, 'before the stop')).toBe(true)
+
+    const result = await $.command.run(typedDelta('stop'))
+    await fake.settle()
+    expect(JSON.stringify(result)).toContain('This session stopped syncing too.')
+    expect(binding(fake)).toMatchObject({ thread, snapshot: false, stopped: true })
+    expect(fake.live()).toBeUndefined()
+    expect(await reminderKind($)).toBe('stopped')
+
+    await turn($, fake, 'native-during', 'while stopped')
+    expect(recorded(fake, 'while stopped')).toBe(false)
+    expect(binding(fake)).toMatchObject({ thread, stopped: true })
+    // Stopping again finds nothing left to stop.
+    expect(JSON.stringify(await $.command.run(typedDelta('stop')))).toContain('already stopped')
+
+    expect(JSON.stringify(await $.command.run(typedDelta('start')))).toContain('This session syncs into its thread again')
+    await fake.settle()
+    expect(binding(fake)).toMatchObject({ thread, snapshot: true })
+    expect(binding(fake).stopped).toBeUndefined()
+    await turn($, fake, 'native-after', 'after the start')
+    expect(recorded(fake, 'after the start')).toBe(true)
+    expect(recorded(fake, 'while stopped')).toBe(false)
+    expect(fake.server.thread).toBe(thread)
+    fake.expectClean()
+  })
+
+  test('/delta share after /delta stop resumes the same thread without exporting again', async ($, on) => {
+    const fake = fakeThreads(on)
+    fake.files.set(POLICY, policy('private', 'org-1'))
+    await startAuto($, fake)
+    const thread = binding(fake).thread
+    await turn($, fake, 'native-before', 'before the stop')
+    await $.command.run(typedDelta('stop'))
+    await fake.settle()
+    const exports = fake.exports
+    await runShare($, fake, 'share')
+    expect(binding(fake)).toMatchObject({ thread, snapshot: true })
+    expect(binding(fake).stopped).toBeUndefined()
+    expect(fake.exports).toBe(exports)
+    await turn($, fake, 'native-after', 'after the share')
+    expect(recorded(fake, 'after the share')).toBe(true)
     fake.expectClean()
   })
 
@@ -294,6 +371,41 @@ describe('automatic activation', () => {
     expect(await reminderKind($)).toBe(expected)
     // The reminder lives on the band; the transcript never carries a line that a later share makes stale.
     expect(fake.logs.some((log) => log.includes('Not syncing') || log.includes('Not set up'))).toBe(false)
+  })
+
+  test('manual sync is indicated only at launch, not after turns, setup, or session switches', async ($, on) => {
+    const fake = fakeThreads(on)
+    fake.files.set(POLICY, policy('manual'))
+    await startAuto($, fake)
+    const ui = await $.ui.mount({ ...abovePrompt, plugin: 'delta' })
+    expect(await ui.find({ text: 'Not syncing', type: 'Text' })).toBeDefined()
+    for (const id of ['first', 'second']) {
+      expect((await $.prompt.submit(prompt(id))).drop).toBeUndefined()
+      await $.turn.start(turnStart(id, id))
+      expect(await ui.find({ text: 'Not syncing', type: 'Text' })).toBeUndefined()
+      await $.turn.complete(turnComplete(id))
+      expect(await reminderKind($)).toBe('none')
+    }
+    // Saving manual mode again must not bring the startup reminder back.
+    fake.answerQuestion = (question: any) => {
+      const { question: text, header } = question.questions[0]
+      return { result: { answers: { [text]: header === 'Team' ? 'Zed' : 'Manual' } } }
+    }
+    expect((await $.command.run(typedDelta('setup'))).text).toContain('Saved Manual with Zed')
+    expect(await reminderKind($)).toBe('none')
+    for (const reason of ['clear', 'clear', 'resume'] as const) {
+      await $.session.end({ ...sessionEnd(fake.session), reason })
+      fake.session = `${fake.session}-${reason}`
+      await $.session.append(clearRow as never)
+      await fake.settle()
+      await fake.advance(0)
+      expect(await reminderKind($)).toBe('none')
+    }
+    await $.session.end(sessionEnd(fake.session))
+    fake.session = 'another-manual-session'
+    await startAuto($, fake)
+    expect(await reminderKind($)).toBe('manual')
+    fake.expectClean()
   })
 
   test('the band switches from its reminder to Syncing as soon as the session is shared, and stays so on resume', async ($, on) => {
@@ -726,6 +838,85 @@ describe('offline recording', () => {
     fake.expectClean()
   })
 
+  for (const { operation, after } of [
+    { operation: 'attach', after: false },
+    { operation: 'attach', after: true },
+    { operation: 'worktree mount', after: false },
+  ]) {
+    test(`a permanent ${operation} failure (${after ? 'lost receipt' : 'refusal'}) preserves partial setup for explicit recovery`, async ($, on) => {
+      const fake = fakeThreads(on)
+      fake.files.set(POLICY, policy('private', 'org-1'))
+      fake.commandFault = {
+        operation, code: 'failed', reason: 'worktree_directory_in_use', retryable: false,
+        message: 'Checkout is managed by another thread', after,
+      }
+      let release!: () => void
+      fake.holdRun = (step) => step === 'attach' ? new Promise<void>((resolve) => { release = resolve }) : undefined
+      await startAuto($, fake)
+      expect((await $.prompt.submit(prompt('during attach'))).drop).toBeUndefined()
+      await $.turn.start(turnStart('native-partial-setup', 'during attach'))
+      await fake.settle()
+      const queued = binding(fake).pending.flatMap((entry: any) => entry.files)
+      expect(queued.length).toBeGreaterThan(0)
+      const records = binding(fake).pending.map((entry: any) => ({
+        sequence: entry.sequence, line: entry.files.map((path: string) => fake.files.get(path)).join(''),
+      }))
+      release()
+      await fake.settle()
+      expect(binding(fake).thread).toBeUndefined()
+      expect(binding(fake).pendingActivation).toMatchObject({
+        thread: fake.threadId, refusal: { transcript: expect.stringContaining('Checkout is managed by another thread') },
+      })
+      const reference = binding(fake).checkoutReference ?? `${binding(fake).pendingWorktree.reference}#t=0`
+      if (operation !== 'attach' || after) expect(fake.server.mount!.reference).toBe(reference)
+      expect(queued.every((path: string) => fake.files.has(path))).toBe(true)
+      expect(fake.records()).toEqual([])
+      const operations = fake.operations()
+
+      // Prompts and resumes keep capturing locally but do not repeat a permanent refusal.
+      expect((await $.prompt.submit(prompt('after refusal'))).drop).toBeUndefined()
+      await $.turn.complete(turnComplete('native-partial-setup'))
+      await fake.settle()
+      await $.session.end(sessionEnd(fake.session))
+      await startAuto($, fake, 'resume')
+      expect(fake.operations()).toEqual(operations)
+      expect(binding(fake).pendingActivation.refusal).toBeDefined()
+      expect(queued.every((path: string) => fake.files.has(path))).toBe(true)
+
+      fake.commandFault = undefined
+      fake.holdRun = undefined
+      await fake.share($)
+      expect(fake.server.localWorktrees.size).toBe(1)
+      expect(fake.server.mount!.reference).toBe(reference)
+      expect(binding(fake)).toMatchObject({ thread: fake.threadId, checkoutReference: reference, pending: [] })
+      expect(binding(fake).pendingActivation).toBeUndefined()
+      for (const record of records)
+        expect(fake.server.records.get(record.sequence)?.line + '\n').toBe(record.line)
+      expect(fake.exports).toBe(0)
+      fake.expectClean()
+    })
+  }
+
+  test('a retryable mount failure automatically resumes the saved setup', async ($, on) => {
+    const fake = fakeThreads(on)
+    fake.files.set(POLICY, policy('private', 'org-1'))
+    fake.commandFault = {
+      operation: 'worktree mount', code: 'app_unavailable', message: 'Delta is unreachable', retryable: true,
+    }
+    await startAuto($, fake)
+    expect(binding(fake).pendingActivation).toEqual({ thread: fake.threadId })
+    expect(binding(fake).thread).toBeUndefined()
+    const reference = binding(fake).checkoutReference
+    fake.commandFault = undefined
+    expect((await $.prompt.submit(prompt('retry setup'))).drop).toBeUndefined()
+    await fake.settle()
+    expect(binding(fake)).toMatchObject({ thread: fake.threadId, checkoutReference: reference })
+    expect(binding(fake).pendingActivation).toBeUndefined()
+    expect(fake.server.localWorktrees.size).toBe(1)
+    expect(fake.operations().filter((operation) => operation === 'create')).toHaveLength(1)
+    fake.expectClean()
+  })
+
   test('a permanent refusal during activation stops recording and removes what was queued', { timeoutMs: 15_000 }, async ($, on) => {
     const fake = fakeThreads(on)
     // Memberships aren't loaded, so only the create itself can refuse.
@@ -790,6 +981,7 @@ describe('store retention', () => {
     seedEnded(store, 'keeper', { next: 5, pending: [{ sequence: 1, files: [], digest: 'x' }] })
     seedEnded(store, 'captured', { captureFailure: 'disk full' })
     seedEnded(store, 'joining', { joinTransition: { locator: 'x' } })
+    seedEnded(store, 'partial-setup', { pendingActivation: { thread: 'created-thread' } })
     seedEnded(store, 'live', { endedAt: undefined })
     await $.session.start(sessionStart)
     await fake.settle()
@@ -799,7 +991,7 @@ describe('store retention', () => {
     expect(keys).not.toContain('session:expired')
     expect(keys).not.toContain('appended:expired')
     // Never a binding without an end marker, one within the horizon, or one something still needs.
-    for (const id of ['live', 'marked-recent', 'keeper', 'captured', 'joining']) expect(keys).toContain(`session:${id}`)
+    for (const id of ['live', 'marked-recent', 'keeper', 'captured', 'joining', 'partial-setup']) expect(keys).toContain(`session:${id}`)
     fake.expectClean()
   })
 

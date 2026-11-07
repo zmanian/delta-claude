@@ -3,6 +3,8 @@ import { describe, expect, test as kitTest, tier } from 'claude-code/testing'
 import { cliFixture } from './testing/cli-fixtures'
 import { claudeVersionWarning } from './core/compatibility'
 import { transcriptCandidate } from './core/transcript'
+import { TITLE_POLL_DELAYS_MS } from './setup/activation'
+import { TITLE_WINDOW_BYTES } from './recording/title'
 import { addRows, itemFingerprint, type PendingRow, RemoteView } from './watch/conversation'
 import {
   abovePrompt, ADA, bash, CHECKOUT, commandOutput, CONFIG, drawBandText, drawReady, expectNoSetupCommands,
@@ -50,11 +52,21 @@ describe('startup and commands', () => {
       await fake.advance(0)
       expect(await link).toBe(`https://delta.dev/join/${fake.shareId}`)
     }
+    const records = fake.records()
+    for (const [command, args] of [['delta-unshare', ''], ['delta', 'unshare']]) {
+      expect((await run(command!, args!)).text).toContain('This thread is private')
+      expect(fake.server.shared).toBe(false)
+      expect(fake.server.registered).toBe(true)
+      expect(fake.store.get(`session:${fake.session}`)).toMatchObject({ visibility: 'private' })
+    }
+    expect(fake.records()).toEqual(records)
     expect(fake.commandRuns).toEqual([])
-    // Only the command a share reports tells Delta which form ran it.
+    // Only the commands that change sharing tell Delta which form ran them.
     expect(fake.cliIntegrations.filter((call) => call.commandForm)).toEqual([
       { operation: 'share', integration: 'claude_code', commandForm: 'dedicated_command' },
       { operation: 'share', integration: 'claude_code', commandForm: 'delta_subcommand' },
+      { operation: 'unshare', integration: 'claude_code', commandForm: 'dedicated_command' },
+      { operation: 'unshare', integration: 'claude_code', commandForm: 'delta_subcommand' },
     ])
     fake.expectClean()
     await $.session.end(sessionEnd(fake.session))
@@ -517,6 +529,46 @@ describe('plugin updates', () => {
 })
 
 describe('sharing', () => {
+  test('unshare refuses an unbound session, reports CLI failure, and keeps a private thread private on reconnect', async ($, on) => {
+    const fake = fakeThreads(on, { messages: [userText('initial')] })
+    await $.session.start(sessionStart)
+    expect((await $.command.run(typedDelta('unshare'))).text).toContain('no Delta thread yet')
+    expect(fake.operations()).not.toContain('unshare')
+    await fake.share($)
+    fake.commandFault = { operation: 'unshare', code: 'remote_refused', message: 'only the owner can change visibility' }
+    expect((await $.command.run(typedDelta('unshare'))).text).toContain('remote_refused')
+    expect(fake.server.shared).toBe(true)
+    expect(fake.store.get(`session:${fake.session}`)).toMatchObject({ visibility: 'organization' })
+    fake.commandFault = undefined
+    fake.failStoreSet = true
+    expect((await $.command.run(typedDelta('unshare'))).text).toContain('thread is private on Delta, but its local sharing status could not be saved')
+    expect(fake.server.shared).toBe(false)
+    expect(fake.store.get(`session:${fake.session}`)).toMatchObject({ visibility: 'organization' })
+    fake.failStoreSet = false
+    expect((await $.command.run(typedDelta('unshare'))).text).toContain('This thread is private')
+    await $.prompt.submit(prompt('working'))
+    await $.turn.start(turnStart('busy', 'working'))
+    await fake.settle()
+    const band = await $.ui.mount({ ...abovePrompt, plugin: 'delta' })
+    expect(await band.find({ type: 'Button', text: 'Share after this turn' })).toBeDefined()
+    await band.press({ key: 'share' })
+    await fake.settle()
+    expect((await $.command.run(typedDelta('unshare'))).text).toContain('This thread is private')
+    await $.turn.complete(turnComplete('busy'))
+    await fake.settle()
+    await fake.advance(0)
+    expect(fake.server.shared).toBe(false)
+    fake.answerQuestion = (question: any) =>
+      ({ result: { answers: { [question.questions[0].question]: 'Keep current sharing' } } })
+    const before = fake.operations().length
+    await $.command.run(shareCommand)
+    await fake.advance(0)
+    expect(fake.operations().slice(before)).not.toContain('share')
+    expect(fake.server.shared).toBe(false)
+    expect(fake.store.get(`session:${fake.session}`)).toMatchObject({ visibility: 'private' })
+    fake.expectClean()
+  })
+
   test('resume with a missing CLI preserves the binding and asks for explicit setup', async ($, on) => {
     const fake = fakeThreads(on)
     fake.cliMissing = true
@@ -983,6 +1035,31 @@ describe('sharing', () => {
 })
 
 describe('recording', () => {
+  test('completed turn stages one Haiku summary with its own prose despite the next turn', async ($, on) => {
+    const fake = fakeThreads(on)
+    await $.session.start(sessionStart)
+    await fake.share($)
+    fake.statusPatch = { version: 'actor.42' }
+    fake.summaryReply = JSON.stringify({
+      summary: 'Collected lemons', threadSearchSummary: {
+        generatedTitle: 'Lemon harvest', summary: 'Harvested lemons', keywords: ['lemons'], intents: ['harvest'],
+      },
+    })
+    await $.turn.start(turnStart('first', 'Collect lemons'))
+    await $.turn.complete({ ...turnComplete('first'), answer: 'Collected lemons' })
+    await $.turn.start(turnStart('second', 'Count oranges'))
+    await fake.settleUntil(() => fake.records().some((record) => record.summary !== undefined))
+    expect(fake.summaryRequests).toHaveLength(1)
+    expect(fake.summaryRequests[0]?.model).toBe('haiku')
+    expect(JSON.parse(fake.summaryRequests[0]!.prompt).completedTurn)
+      .toBe('user: Collect lemons\n\nassistant: Collected lemons')
+    expect(fake.records().find((record) => record.summary !== undefined))
+      .toMatchObject({ turnSequence: 1, summary: {
+        turnSummary: 'Collected lemons', sourceVersion: 'actor.42',
+      } })
+    fake.expectClean()
+  })
+
   test('marks recorded live Claude messages and tool activity', async ($, on) => {
     const fake = fakeThreads(on)
     await $.session.start(sessionStart)
@@ -1080,6 +1157,53 @@ describe('recording', () => {
       expect.anything(),
       expect.objectContaining({ toolCallId: 'first', name: 'Bash', title: 'echo first', kind: 'execute' }),
     ])
+    fake.expectClean()
+  })
+
+  for (const { max, plans } of [{ max: 10, plans: true }, { max: 9, plans: false }]) test(
+    `a TodoWrite records its turn's plan where the CLI accepts plans (max ${max})`, async ($, on) => {
+    const todos = (status: string) => ({ todos: [{ content: 'Fix it', activeForm: 'Fixing it', status }] })
+    // A todo list from before the share is history outside any turn, which Delta shows no plan for.
+    const fake = fakeThreads(on, { messages: [
+      userText('one'),
+      { role: 'assistant', content: [
+        { type: 'tool_use', id: 'old-todos', name: 'TodoWrite', input: todos('pending') },
+      ] },
+    ] as never })
+    fake.contractRange = { min: 8, max }
+    await $.session.start(sessionStart)
+    await fake.share($)
+    await $.prompt.submit(prompt('fix it'))
+    await $.session.append({ door: 'prompt', uuid: 'todo-user',
+      message: { type: 'user', role: 'user', content: [{ type: 'text', text: 'fix it' }] } } as never)
+    await $.turn.start(turnStart('todo-turn'))
+    await $.session.append({ door: 'response', uuid: 'todo-agent',
+      message: { type: 'assistant', role: 'assistant', content: [
+        { type: 'tool_use', id: 'todos', name: 'TodoWrite', input: todos('in_progress') },
+      ] } } as never)
+    await $.tool.call({ tool: 'TodoWrite', tool_use_id: 'todos', ...todos('in_progress') } as never)
+    await $.session.append({ door: 'tool-result', uuid: 'todo-result',
+      message: { type: 'user', role: 'user', content: [
+        { type: 'tool_result', tool_use_id: 'todos', content: 'Todos have been modified successfully' },
+      ] } } as never)
+    const recorded = plans ? 'plan_update' : 'tool_call_update'
+    await fake.settleUntil(() => fake.updates().some((record) =>
+      record.update?.sessionUpdate === recorded && record.turnSequence !== undefined))
+    const start = fake.updates().find((record) => record.update?.state === 'running')!.sequence
+    const todoRecords = fake.updates().filter((record) => record.update?.sessionUpdate === 'plan_update' ||
+      ['old-todos', 'todos'].includes(record.update?.toolCallId))
+    if (plans) {
+      expect(todoRecords).toEqual([expect.objectContaining({ turnSequence: start, update: {
+        sessionUpdate: 'plan_update',
+        plan: { type: 'items', planId: 'plan', entries: [
+          { content: 'Fixing it', priority: 'medium', status: 'in_progress' },
+        ] },
+      } })])
+    } else {
+      // An older Delta rejects plans, so the call stays a tool call there.
+      expect(todoRecords.map((record) => [record.update?.toolCallId, record.update?.sessionUpdate]))
+        .toEqual(expect.arrayContaining([['old-todos', 'tool_call_update'], ['todos', 'tool_call_update']]))
+    }
     fake.expectClean()
   })
 
@@ -1316,11 +1440,11 @@ describe('recording', () => {
     fake.failRemoval = true
     fake.appendOffline = false
     let releaseListing!: () => void
-    fake.holdListing = new Promise<void>((resolve) => { releaseListing = resolve })
+    fake.holdOutboxListing = new Promise<void>((resolve) => { releaseListing = resolve })
     expect(await fake.share($)).toBe(`https://delta.dev/join/${fake.shareId}`)
     expect(fake.records().map((record) => record.sequence)).toEqual([1, 2])
     releaseListing()
-    fake.holdListing = undefined
+    fake.holdOutboxListing = undefined
     await fake.settle()
     fake.failRemoval = false
     await $.session.end(sessionEnd(fake.session))
@@ -2970,6 +3094,62 @@ describe('remote activity', () => {
 })
 
 describe('the status band', () => {
+  for (const surface of ['terminal', 'desktop'] as const) {
+    for (const state of ['not set up', 'manual', 'syncing'] as const) {
+      test(`preserves a downstream AbovePrompt band while ${state} on ${surface} (#27)`, async ($, on) => {
+        let downstreamDraws = 0
+        // Stand in for the next plugin's band at the engine boundary.
+        on('ui.render', { component: 'AbovePrompt' }, () => {
+          downstreamDraws++
+          return { type: 'Text', props: {}, children: ['hello from the downstream band'] }
+        })
+        const fake = fakeThreads(on)
+        if (state === 'manual') fake.files.set(POLICY, policy('manual'))
+        const mount = (hasSurvey = false) => $.ui.mount({
+          ...abovePrompt, surface, plugin: 'delta', props: { ...abovePrompt.props, hasSurvey },
+        })
+        const beforeStartup = await mount()
+        expect(await beforeStartup.find({ text: 'hello from the downstream band' })).toBeDefined()
+        expect(downstreamDraws).toBeGreaterThan(0)
+        await beforeStartup.unmount()
+
+        await $.session.start(sessionStart)
+        if (state === 'syncing') await fake.share($)
+        await fake.settle()
+        // The survey path still reaches the downstream renderer after startup.
+        const survey = await mount(true)
+        expect(await survey.find({ text: 'hello from the downstream band' })).toBeDefined()
+        await survey.unmount()
+        const beforeDraw = downstreamDraws
+        const shown = await mount()
+        const label = state === 'manual' ? 'Not syncing' : state === 'not set up' ? 'Not set up' : 'Syncing'
+        expect(await shown.find({ text: label })).toBeDefined()
+        expect(downstreamDraws).toBe(beforeDraw + 1)
+        expect(await shown.find({ text: 'hello from the downstream band' })).toBeDefined()
+      })
+    }
+  }
+
+  test('does not nest the engine placeholder inside its band', async ($, on) => {
+    let downstreamDraws = 0
+    on('ui.render', { component: 'AbovePrompt' }, () => {
+      downstreamDraws++
+      return { type: 'engine', ref: 0 }
+    })
+    const fake = fakeThreads(on)
+    fake.files.set(POLICY, policy('manual'))
+    await $.session.start(sessionStart)
+    await fake.settle()
+    for (const surface of ['terminal', 'desktop'] as const) {
+      const ui = await $.ui.mount({ ...abovePrompt, surface, plugin: 'delta' })
+      expect(await ui.find({ text: 'Not syncing' })).toBeDefined()
+      expect(JSON.stringify(await ui.drawn())).not.toContain('"type":"engine"')
+      await ui.unmount()
+    }
+    expect(downstreamDraws).toBe(2)
+    fake.expectClean()
+  })
+
   test('child updates preserve siblings and reconnect replaces the inventory while the parent is idle', async ($, on) => {
     const fake = fakeThreads(on)
     fake.server.children = [
@@ -3258,7 +3438,7 @@ describe('the recording contract', () => {
   test('a CLI newer than this plugin asks the person to update the plugin', async ($, on) => {
     const fake = fakeThreads(on, { messages: [userText('initial')] })
     await $.session.start(sessionStart)
-    fake.contractRange = { min: 9, max: 10 }
+    fake.contractRange = { min: 11, max: 12 }
     expect(await fake.share($)).toContain('Update the Delta plugin')
     expect(fake.server.thread).toBeUndefined()
     expect(fake.records()).toEqual([])
@@ -3295,7 +3475,7 @@ describe('the recording contract', () => {
     await $.session.end(sessionEnd(fake.session))
     const watches = fake.watches.length
     // A resumed session re-checks; a Delta that now speaks only a newer contract blocks it.
-    fake.contractRange = { min: 9, max: 10 }
+    fake.contractRange = { min: 11, max: 12 }
     await $.session.start(sessionStart)
     expect(fake.store.get(`session:${fake.session}`)).toEqual(binding)
     expect(fake.watches.length).toBe(watches)
@@ -3317,7 +3497,7 @@ describe('the recording contract', () => {
     const checksAtAppend: number[] = []
     fake.holdRun = (operation) => { if (operation === 'append') checksAtAppend.push(fake.contractChecks) }
     // An incompatible CLI is refused before anything is appended.
-    fake.contractRange = { min: 9, max: 10 }
+    fake.contractRange = { min: 11, max: 12 }
     await $.session.start(sessionStart)
     await fake.settle()
     expect(checksAtAppend).toEqual([])
@@ -3372,8 +3552,6 @@ describe('recording titles', () => {
     await $.session.start(sessionStart)
     await fake.share($)
     const transcript = transcriptCandidate(CONFIG, CHECKOUT, fake.session)
-    const titles = () => fake.records().flatMap((record) =>
-      record.update?.sessionUpdate === 'session_info_update' ? [record.update.title] : [])
     let turns = 0
     const stop = async (...lines: object[]) => {
       fake.files.set(transcript, [...(fake.files.get(transcript) ?? '').split('\n').filter(Boolean),
@@ -3384,16 +3562,16 @@ describe('recording titles', () => {
     }
     // No title yet: nothing is recorded.
     await stop({ type: 'user', message: { role: 'user', content: 'hello' } })
-    expect(titles()).toEqual([])
+    expect(titles(fake)).toEqual([])
     await stop({ type: 'ai-title', aiTitle: 'Fix the parser', sessionId: fake.session })
-    expect(titles()).toEqual(['Fix the parser'])
+    expect(titles(fake)).toEqual(['Fix the parser'])
     // The same title at a later turn's end is not recorded again.
     await stop()
-    expect(titles()).toEqual(['Fix the parser'])
+    expect(titles(fake)).toEqual(['Fix the parser'])
     // A rename wins over a title Claude chooses after it.
     await stop({ type: 'custom-title', customTitle: 'Parser rewrite', sessionId: fake.session },
       { type: 'ai-title', aiTitle: 'Something else', sessionId: fake.session })
-    expect(titles()).toEqual(['Fix the parser', 'Parser rewrite'])
+    expect(titles(fake)).toEqual(['Fix the parser', 'Parser rewrite'])
     expect((fake.store.get(`session:${fake.session}`) as { title?: unknown }).title).toBe('Parser rewrite')
     // Each read starts where the last one ended, never at the start of the file again.
     const reads = fake.commands.filter((argv) => argv[0] === 'tail').map((argv) => Number(argv[2]!.slice(1)))
@@ -3402,7 +3580,7 @@ describe('recording titles', () => {
     fake.expectClean()
   })
 
-  test("an automatic session takes Claude's title at its first reply, before its thread exists", { timeoutMs: 15_000 }, async ($, on) => {
+  test("an automatic session takes Claude's title while its first turn runs, before its thread exists", { timeoutMs: 15_000 }, async ($, on) => {
     const fake = fakeThreads(on)
     fake.files.set(POLICY, policy('organization', 'org-1'))
     let release!: () => void
@@ -3416,12 +3594,8 @@ describe('recording titles', () => {
     await $.turn.start(turnStart('native-title'))
     fake.files.set(transcriptCandidate(CONFIG, CHECKOUT, fake.session),
       JSON.stringify({ type: 'ai-title', aiTitle: 'Fix the parser', sessionId: fake.session }) + '\n')
-    await $.session.append({
-      door: 'response', uuid: 'first-reply',
-      message: { type: 'assistant', role: 'assistant', content: [{ type: 'text', text: 'On it.' }] },
-    } as never)
-    await fake.settle()
-    // Staged while the thread is still being attached, and before the turn ends.
+    await fake.advance(TITLE_POLL_DELAYS_MS[0]!)
+    // Staged while the thread is still being attached, with no reply yet and before the turn ends.
     const stored = fake.store.get(`session:${fake.session}`) as { thread?: unknown; title?: unknown }
     expect(stored.thread).toBeUndefined()
     expect(stored.title).toBe('Fix the parser')
@@ -3429,35 +3603,111 @@ describe('recording titles', () => {
     await fake.settle()
     await fake.advance(120_000)
     await fake.settle()
-    expect(fake.records().flatMap((record) =>
-      record.update?.sessionUpdate === 'session_info_update' ? [record.update.title] : [])).toEqual(['Fix the parser'])
+    expect(titles(fake)).toEqual(['Fix the parser'])
     fake.expectClean()
   })
 
-  test('an untitled session reads its transcript at the first reply of each turn, not at every reply', async ($, on) => {
+  test("a shared session's thread takes Claude's title as soon as it is written, not at a reply or the turn's end", async ($, on) => {
     const fake = fakeThreads(on, { messages: [userText('initial')] })
     await $.session.start(sessionStart)
     await fake.share($)
     const transcript = transcriptCandidate(CONFIG, CHECKOUT, fake.session)
-    const reply = async (uuid: string) => {
-      fake.files.set(transcript, (fake.files.get(transcript) ?? '') + JSON.stringify({ type: 'assistant', uuid }) + '\n')
-      await $.session.append({
-        door: 'response', uuid,
-        message: { type: 'assistant', role: 'assistant', content: [{ type: 'text', text: uuid }] },
-      } as never)
-      await fake.settle()
-    }
+    fake.files.set(transcript, JSON.stringify({ type: 'user', message: { role: 'user', content: 'fix the parser' } }) + '\n')
     const reads = () => fake.commands.filter((argv) => argv[0] === 'tail').length
-    await $.turn.start(turnStart('turn-1', 'hello'))
-    await reply('first')
-    expect(reads()).toBe(1)
-    await reply('second')
-    expect(reads()).toBe(1)
+    await $.turn.start(turnStart('turn-1', 'fix the parser'))
+    await fake.advance(TITLE_POLL_DELAYS_MS[0]!)
+    expect(titles(fake)).toEqual([])
+    // Claude writes its title a moment after the prompt, while its reply is still being written.
+    fake.files.set(transcript, fake.files.get(transcript)! +
+      JSON.stringify({ type: 'ai-title', aiTitle: 'Fix the parser', sessionId: fake.session }) + '\n')
+    await fake.advance(TITLE_POLL_DELAYS_MS[1]!)
+    expect(titles(fake)).toEqual(['Fix the parser'])
+    // A titled session stops polling, this turn and the next, while its transcript grows; only a turn's
+    // end reads it again.
+    const titled = reads()
+    const reply = (uuid: string) =>
+      fake.files.set(transcript, fake.files.get(transcript)! + JSON.stringify({ type: 'assistant', uuid }) + '\n')
+    reply('first')
+    await fake.advance(60_000)
+    expect(reads()).toBe(titled)
     await $.turn.complete(turnComplete('turn-1'))
     await fake.settle()
+    expect(reads()).toBe(titled + 1)
     await $.turn.start(turnStart('turn-2', 'again'))
-    await reply('third')
-    expect(reads()).toBe(3)
+    reply('second')
+    await fake.advance(60_000)
+    expect(reads()).toBe(titled + 1)
+    expect(titles(fake)).toEqual(['Fix the parser'])
+    fake.expectClean()
+  })
+
+  test('sharing a session Claude already titled names its thread with the share, without another turn', async ($, on) => {
+    const fake = fakeThreads(on, { messages: [userText('initial')] })
+    await $.session.start(sessionStart)
+    const transcript = transcriptCandidate(CONFIG, CHECKOUT, fake.session)
+    // A long turn after the title, larger than the first window a read takes in, as agentic work writes.
+    const work = JSON.stringify({ type: 'user', message: { role: 'user', content: 'x'.repeat(1024) } }) + '\n'
+    fake.files.set(transcript, JSON.stringify({ type: 'ai-title', aiTitle: 'Fix the parser', sessionId: fake.session }) + '\n' +
+      work.repeat(Math.ceil(TITLE_WINDOW_BYTES / work.length) + 1))
+    // An unshared session's turn records no title.
+    await $.turn.start(turnStart('turn-1', 'hello'))
+    await $.turn.complete(turnComplete('turn-1'))
+    await fake.advance(60_000)
+    expect(fake.commands.filter((argv) => argv[0] === 'tail')).toEqual([])
+    await fake.share($)
+    await fake.settle()
+    expect(titles(fake)).toEqual(['Fix the parser'])
+    // The first window held no title, so the next took in the whole file.
+    expect(fake.commands.filter((argv) => argv[0] === 'tail').map((argv) => argv[2])).toEqual([
+      `+${new TextEncoder().encode(fake.files.get(transcript)!).byteLength - TITLE_WINDOW_BYTES + 1}`, '+1',
+    ])
+    fake.expectClean()
+  })
+
+  test('/rename renames the thread at once, even while another read of the transcript runs', async ($, on) => {
+    const fake = fakeThreads(on, { messages: [userText('initial')] })
+    const transcript = transcriptCandidate(CONFIG, CHECKOUT, fake.session)
+    const append = (row: object) => fake.files.set(transcript, (fake.files.get(transcript) ?? '') + JSON.stringify(row) + '\n')
+    const rename = (args: string) => $.command.run({ ...shareCommand, command: 'rename', args })
+    append({ type: 'ai-title', aiTitle: 'Fix the parser', sessionId: fake.session })
+    await $.session.start(sessionStart)
+    await fake.share($)
+    await fake.settle()
+    expect(titles(fake)).toEqual(['Fix the parser'])
+    expect((await rename('Parser rewrite')).text).toBe('Session renamed to: Parser rewrite')
+    await fake.settle()
+    expect(titles(fake)).toEqual(['Fix the parser', 'Parser rewrite'])
+    // A rename while a turn's end is still reading the transcript is read after it, not dropped.
+    let release!: () => void
+    fake.holdTranscriptRead = new Promise<void>((resolve) => { release = resolve })
+    await $.turn.start(turnStart('turn-1', 'hello'))
+    append({ type: 'assistant', uuid: 'reply' })
+    await $.turn.complete(turnComplete('turn-1'))
+    await fake.settle()
+    await rename('')
+    await fake.settle()
+    fake.holdTranscriptRead = undefined
+    release()
+    await fake.settle()
+    expect(titles(fake)).toEqual(['Fix the parser', 'Parser rewrite', 'chosen-by-claude'])
+    fake.expectClean()
+  })
+
+  test('a /rename while the session is being shared is delivered by the share, and never pauses it', async ($, on) => {
+    const fake = fakeThreads(on, { messages: [userText('initial')] })
+    let release: (() => void) | undefined
+    fake.holdRun = (operation) => operation === 'attach' ? new Promise<void>((resolve) => { release = resolve }) : undefined
+    await $.session.start(sessionStart)
+    const shared = fake.share($)
+    // The thread exists and the snapshot is staged, but the thread is not attached or published yet.
+    await fake.settleUntil(() => release !== undefined)
+    await $.command.run({ ...shareCommand, command: 'rename', args: 'Parser rewrite' })
+    await fake.settle()
+    fake.holdRun = undefined
+    release!()
+    expect(await shared).toBe(`https://delta.dev/join/${fake.shareId}`)
+    await fake.settle()
+    expect(titles(fake)).toEqual(['Parser rewrite'])
     fake.expectClean()
   })
 
@@ -3496,8 +3746,6 @@ describe('recording titles', () => {
     await $.session.start(sessionStart)
     await fake.share($)
     const transcript = transcriptCandidate(CONFIG, CHECKOUT, fake.session)
-    const titles = () => fake.records().flatMap((record) =>
-      record.update?.sessionUpdate === 'session_info_update' ? [record.update.title] : [])
     let turns = 0
     const stop = async () => {
       await $.turn.start(turnStart(`turn-${++turns}`, 'hello'))
@@ -3509,15 +3757,21 @@ describe('recording titles', () => {
     fake.failTranscriptRead = true
     fake.files.set(transcript, JSON.stringify({ type: 'ai-title', aiTitle: 'Read whole', sessionId: fake.session }) + '\n')
     await stop()
-    expect(titles()).toEqual(['Read whole'])
+    expect(titles(fake)).toEqual(['Read whole'])
     // The session reads its transcript whole from then on, without trying the offset read again.
     const tries = fake.commands.filter((argv) => argv[0] === 'tail').length
     fake.files.set(transcript, fake.files.get(transcript)! + JSON.stringify({ type: 'custom-title', customTitle: 'Renamed' }) + '\n')
     await stop()
-    expect(titles()).toEqual(['Read whole', 'Renamed'])
+    expect(titles(fake)).toEqual(['Read whole', 'Renamed'])
     expect(fake.commands.filter((argv) => argv[0] === 'tail')).toHaveLength(tries)
     expect(fake.logs.join('\n')).not.toContain('title')
     expect((await $.prompt.submit(prompt('still sharing'))).drop).toBeUndefined()
     fake.expectClean()
   })
 })
+
+/** The titles the session recorded for its thread, in order. */
+function titles(fake: ReturnType<typeof fakeThreads>) {
+  return fake.records().flatMap((record) =>
+    record.update?.sessionUpdate === 'session_info_update' ? [record.update.title] : [])
+}
