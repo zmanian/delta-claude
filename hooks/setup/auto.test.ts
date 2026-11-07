@@ -138,6 +138,73 @@ describe('automatic activation', () => {
     fake.expectClean()
   })
 
+  /** Run one composer turn with `text`, as Claude does, and let its delivery finish. */
+  async function turn($: Engine, fake: ReturnType<typeof fakeThreads>, id: string, text: string) {
+    await $.prompt.submit(prompt(text))
+    await $.session.append({
+      door: 'prompt', origin: { kind: 'composer' }, uuid: `${id}-prompt`,
+      message: { type: 'user', role: 'user', content: [{ type: 'text', text }] },
+    } as never)
+    await $.turn.start(turnStart(id, text))
+    await fake.settle()
+    await $.turn.complete(turnComplete(id))
+    await fake.settle()
+    await fake.advance(120_000)
+    await fake.settle()
+  }
+  const recorded = (fake: ReturnType<typeof fakeThreads>, text: string) =>
+    fake.updates().some((record) => JSON.stringify(record.update).includes(text))
+
+  test('/delta stop pauses a session that syncs, and /delta start resumes it into the same thread', async ($, on) => {
+    const fake = fakeThreads(on)
+    fake.files.set(POLICY, policy('private', 'org-1'))
+    await startAuto($, fake)
+    const thread = binding(fake).thread
+    await turn($, fake, 'native-before', 'before the stop')
+    expect(recorded(fake, 'before the stop')).toBe(true)
+
+    const result = await $.command.run(typedDelta('stop'))
+    await fake.settle()
+    expect(JSON.stringify(result)).toContain('This session stopped syncing too.')
+    expect(binding(fake)).toMatchObject({ thread, snapshot: false, stopped: true })
+    expect(fake.live()).toBeUndefined()
+    expect(await reminderKind($)).toBe('stopped')
+
+    await turn($, fake, 'native-during', 'while stopped')
+    expect(recorded(fake, 'while stopped')).toBe(false)
+    expect(binding(fake)).toMatchObject({ thread, stopped: true })
+    // Stopping again finds nothing left to stop.
+    expect(JSON.stringify(await $.command.run(typedDelta('stop')))).toContain('already stopped')
+
+    expect(JSON.stringify(await $.command.run(typedDelta('start')))).toContain('This session syncs into its thread again')
+    await fake.settle()
+    expect(binding(fake)).toMatchObject({ thread, snapshot: true })
+    expect(binding(fake).stopped).toBeUndefined()
+    await turn($, fake, 'native-after', 'after the start')
+    expect(recorded(fake, 'after the start')).toBe(true)
+    expect(recorded(fake, 'while stopped')).toBe(false)
+    expect(fake.server.thread).toBe(thread)
+    fake.expectClean()
+  })
+
+  test('/delta share after /delta stop resumes the same thread without exporting again', async ($, on) => {
+    const fake = fakeThreads(on)
+    fake.files.set(POLICY, policy('private', 'org-1'))
+    await startAuto($, fake)
+    const thread = binding(fake).thread
+    await turn($, fake, 'native-before', 'before the stop')
+    await $.command.run(typedDelta('stop'))
+    await fake.settle()
+    const exports = fake.exports
+    await runShare($, fake, 'share')
+    expect(binding(fake)).toMatchObject({ thread, snapshot: true })
+    expect(binding(fake).stopped).toBeUndefined()
+    expect(fake.exports).toBe(exports)
+    await turn($, fake, 'native-after', 'after the share')
+    expect(recorded(fake, 'after the share')).toBe(true)
+    fake.expectClean()
+  })
+
   test('a clear session activates and uploads to the organization', async ($, on) => {
     const fake = fakeThreads(on)
     fake.files.set(POLICY, policy('organization', 'org-1'))
